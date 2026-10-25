@@ -1,0 +1,49 @@
+{
+  "name": "reelapi-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for reelapi: burn captions, build slideshows, generate AI shorts and run ffmpeg from your coding agent, with the finished files saved to your disk.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "reelapi-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bitgate/reelapi-mcp.git"
+  },
+  "homepage": "https://reelapi.bitgate.dev",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "video",
+    "ffmpeg",
+    "captions",
+    "subtitles",
+    "slideshow",
+    "shorts",
+    "tiktok",
+    "reels",
+    "claude-code",
+    "cursor"
+  ],
+  "scripts": {
+    "bundle": "node scripts/bundle.mjs",
+    "bundle:check": "node scripts/bundle.mjs --check",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@types/node": "^20.19.43",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "~4.0.18",
+    "zod": "^4.6.7"
+  }
+}
