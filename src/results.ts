@@ -64,10 +64,16 @@ export function succeededResult(job: Job, files: SavedFile[], ctx: ToolContext):
 
 export function runningResult(job: Job, ctx: ToolContext): CallToolResult {
   const stage = job.stage ? ` (${job.stage})` : "";
+  const age = jobAge(job);
   return textResult(
-    `Job ${job.id} is still ${job.status}${stage} after ${elapsedSeconds(ctx)} s. Call get_job with job_id "${job.id}" to keep waiting; it saves the files when the job is done.`,
+    `Job ${job.id} is still ${job.status}${stage}${age === undefined ? "" : `, started ${age} s ago`}. Call get_job with job_id "${job.id}" to keep waiting; it saves the files when the job is done.`,
     { status: job.status, job_id: job.id, stage: job.stage ?? undefined, elapsed_s: elapsedSeconds(ctx) },
   );
+}
+
+export function jobAge(job: Job): number | undefined {
+  const created = Date.parse(job.created_at);
+  return Number.isFinite(created) ? Math.max(0, Math.round((Date.now() - created) / 1000)) : undefined;
 }
 
 export function failedResult(job: Job): CallToolResult {

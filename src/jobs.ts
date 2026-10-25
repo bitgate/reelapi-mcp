@@ -5,7 +5,7 @@ import type { Job, ReelApi } from "./api.js";
 import type { Config } from "./config.js";
 import { elapsedSeconds, type SavedFile, type ToolContext } from "./context.js";
 import { errorMessage, log } from "./log.js";
-import { failedResult, runningResult, succeededResult } from "./results.js";
+import { failedResult, jobAge, runningResult, succeededResult } from "./results.js";
 import { resolvePath, type Workspace } from "./workspace.js";
 
 const POLL_WAIT_S = 10;
@@ -48,7 +48,7 @@ export class JobRunner {
       const remainingS = Math.floor((deadline - Date.now()) / 1000);
       if (remainingS <= 0) return runningResult(job, ctx);
 
-      ctx.progress(`${job.op} ${job.status}${job.stage ? ` (${job.stage})` : ""}, ${Math.round(elapsedSeconds(ctx))} s`);
+      ctx.progress(`${job.op} ${job.status}${job.stage ? ` (${job.stage})` : ""}, ${jobAge(job) ?? Math.round(elapsedSeconds(ctx))} s`);
       job = await this.api.getJob(job.id, Math.min(POLL_WAIT_S, remainingS), ctx.signal);
     }
 
