@@ -20,6 +20,7 @@ Local stdio MCP server that wraps the reelapi video API. The API contract lives 
 - No `build`, `prepare`, `prepack`, `install`, `preinstall` or `postinstall` scripts: npm would then run a full dev install whenever someone starts the server with `npx github:bitgate/reelapi-mcp`.
 - No runtime dependencies. Everything is bundled into `dist/index.js`.
 - Import zod as `import * as z from "zod"`; `import { z }` pulls every zod locale into the bundle.
+- `vite` is pinned to 7 in `overrides`: vite 8 crashes npm 10's installer (`Cannot read properties of null (reading 'edgesOut')`).
 - Keep tool descriptions short and concrete: what it does, when to use it instead of local ffmpeg, what comes back, how long it takes.
 - Bump `version` in `package.json` and `src/version.ts` together (a test checks they match).
 
