@@ -15,18 +15,17 @@ export type ConfigResult = { ok: true; config: Config } | { ok: false; error: st
 export function loadConfig(env: NodeJS.ProcessEnv): ConfigResult {
   const problems: string[] = [];
 
-  // Configs from before the rename still use the REELAPI_* names
-  const apiKey = env.REELSDK_KEY?.trim() || env.REELAPI_KEY?.trim() || "";
+  const apiKey = env.REELSDK_KEY?.trim() || "";
   if (!apiKey) {
-    problems.push("REELSDK_KEY is not set. Add your reelsdk API key (rk_live_...) to the env of this MCP server in your client config, then restart the server.");
+    problems.push("REELSDK_KEY is not set. Add your reelsdk API key (rsdk_live_...) to the env of this MCP server in your client config, then restart the server.");
   }
 
-  const baseUrl = (env.REELSDK_BASE_URL?.trim() || env.REELAPI_BASE_URL?.trim() || DEFAULT_BASE_URL).replace(/\/+$/, "");
+  const baseUrl = (env.REELSDK_BASE_URL?.trim() || DEFAULT_BASE_URL).replace(/\/+$/, "");
   if (!URL.canParse(baseUrl) || !/^https?:$/.test(new URL(baseUrl).protocol)) {
     problems.push(`REELSDK_BASE_URL must be an http(s) URL, got "${baseUrl}".`);
   }
 
-  const rawWait = env.REELSDK_WAIT_S?.trim() || env.REELAPI_WAIT_S?.trim();
+  const rawWait = env.REELSDK_WAIT_S?.trim();
   const waitSeconds = rawWait ? Number(rawWait) : DEFAULT_WAIT_S;
   if (!Number.isFinite(waitSeconds) || waitSeconds < 0) {
     problems.push(`REELSDK_WAIT_S must be a number of seconds from 0 to ${MAX_WAIT_S}, got "${rawWait}".`);
@@ -39,7 +38,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): ConfigResult {
     config: {
       apiKey,
       baseUrl,
-      outputDir: env.REELSDK_OUTPUT_DIR?.trim() || env.REELAPI_OUTPUT_DIR?.trim() || DEFAULT_OUTPUT_DIR,
+      outputDir: env.REELSDK_OUTPUT_DIR?.trim() || DEFAULT_OUTPUT_DIR,
       waitSeconds: Math.min(MAX_WAIT_S, Math.floor(waitSeconds)),
     },
   };

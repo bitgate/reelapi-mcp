@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Local stdio MCP server that wraps the reelsdk video API. The API contract lives in the `bitgate/reelapi` repo (`docs/CONTRACT.md`, `docs/SHORTS.md`) and at https://api.reelsdk.com/openapi.json.
+Local stdio MCP server that wraps the reelsdk video API. The API contract lives in the `bitgate/reelsdk` repo (`docs/CONTRACT.md`, `docs/SHORTS.md`) and at https://api.reelsdk.com/openapi.json.
 
 ## Layout
 
@@ -17,7 +17,7 @@ Local stdio MCP server that wraps the reelsdk video API. The API contract lives 
 
 - Never write to stdout: it's the protocol channel. Log with `log()` from `src/log.ts` (stderr).
 - `dist/index.js` is committed and must match the source: run `npm run bundle` and commit it. CI fails on drift (`npm run bundle:check`).
-- No `build`, `prepare`, `prepack`, `install`, `preinstall` or `postinstall` scripts: npm would then run a full dev install whenever someone starts the server with `npx github:bitgate/reelapi-mcp`.
+- No `build`, `prepare`, `prepack`, `install`, `preinstall` or `postinstall` scripts: npm would then run a full dev install whenever someone starts the server with `npx github:bitgate/reelsdk-mcp`.
 - No runtime dependencies. Everything is bundled into `dist/index.js`.
 - Import zod as `import * as z from "zod"`; `import { z }` pulls every zod locale into the bundle.
 - `vite` is pinned to 7 in `overrides`: vite 8 crashes npm 10's installer (`Cannot read properties of null (reading 'edgesOut')`).
@@ -30,4 +30,4 @@ Local stdio MCP server that wraps the reelsdk video API. The API contract lives 
 npm run typecheck && npm test && npm run bundle:check
 ```
 
-Live smoke test: `npx @modelcontextprotocol/inspector -e REELSDK_KEY=rk_live_... node dist/index.js`.
+Live smoke test: `npx @modelcontextprotocol/inspector -e REELSDK_KEY=rsdk_live_... node dist/index.js`.

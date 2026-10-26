@@ -171,7 +171,7 @@ describe("errors", () => {
   });
 
   it("explains a rejected key", async () => {
-    const client = await connect({ REELSDK_KEY: "rk_live_wrong" });
+    const client = await connect({ REELSDK_KEY: "rsdk_live_wrong" });
     const outcome = await call(client, "make_slideshow", { images: ["https://example.com/a.jpg"] });
 
     expect(outcome.isError).toBe(true);
