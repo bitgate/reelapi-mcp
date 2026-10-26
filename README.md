@@ -13,12 +13,12 @@ The agent calls a tool, local files are uploaded, the job runs on [reelsdk](http
 
 ## Setup
 
-You need Node 20+ and a reelsdk API key (`rk_live_...`).
+You need Node 20+ and a reelsdk API key (`rsdk_live_...`).
 
 ### Claude Code
 
 ```bash
-claude mcp add reelsdk --env REELSDK_KEY=rk_live_xxx -- npx -y github:bitgate/reelapi-mcp
+claude mcp add reelsdk --env REELSDK_KEY=rsdk_live_xxx -- npx -y github:bitgate/reelsdk-mcp
 ```
 
 Add `--scope project` to share it with your team through `.mcp.json`.
@@ -32,8 +32,8 @@ Add `--scope project` to share it with your team through `.mcp.json`.
   "mcpServers": {
     "reelsdk": {
       "command": "npx",
-      "args": ["-y", "github:bitgate/reelapi-mcp"],
-      "env": { "REELSDK_KEY": "rk_live_xxx" }
+      "args": ["-y", "github:bitgate/reelsdk-mcp"],
+      "env": { "REELSDK_KEY": "rsdk_live_xxx" }
     }
   }
 }
@@ -48,8 +48,8 @@ Settings → Developer → Edit Config (`claude_desktop_config.json`). Desktop h
   "mcpServers": {
     "reelsdk": {
       "command": "npx",
-      "args": ["-y", "github:bitgate/reelapi-mcp"],
-      "env": { "REELSDK_KEY": "rk_live_xxx", "REELSDK_OUTPUT_DIR": "~/Movies/reelsdk" }
+      "args": ["-y", "github:bitgate/reelsdk-mcp"],
+      "env": { "REELSDK_KEY": "rsdk_live_xxx", "REELSDK_OUTPUT_DIR": "~/Movies/reelsdk" }
     }
   }
 }
@@ -66,7 +66,7 @@ Settings → Developer → Edit Config (`claude_desktop_config.json`). Desktop h
     "reelsdk": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "github:bitgate/reelapi-mcp"],
+      "args": ["-y", "github:bitgate/reelsdk-mcp"],
       "env": { "REELSDK_KEY": "${input:reelsdk-key}" }
     }
   }
@@ -96,7 +96,7 @@ Tools wait up to `REELSDK_WAIT_S` seconds, sending progress updates if your clie
 
 | Variable | Default | |
 | --- | --- | --- |
-| `REELSDK_KEY` | | Required. Your `rk_live_...` key. |
+| `REELSDK_KEY` | | Required. Your `rsdk_live_...` key. |
 | `REELSDK_OUTPUT_DIR` | `reelsdk-output` | Where results are saved. Relative paths resolve against the project root. |
 | `REELSDK_WAIT_S` | `50` | Seconds a tool waits for its job before handing back a `job_id` (0-300). Keep it under your client's tool timeout. |
 | `REELSDK_BASE_URL` | `https://api.reelsdk.com` | API endpoint. |
@@ -116,7 +116,7 @@ npm run typecheck
 npm run bundle      # rebuilds dist/index.js, which is committed
 ```
 
-`dist/` is committed so `npx github:bitgate/reelapi-mcp` starts without a build step. See [AGENTS.md](AGENTS.md).
+`dist/` is committed so `npx github:bitgate/reelsdk-mcp` starts without a build step. See [AGENTS.md](AGENTS.md).
 
 ## License
 

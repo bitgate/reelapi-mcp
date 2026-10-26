@@ -12,7 +12,7 @@ export class ToolError extends Error {
 
 const HINTS: Record<string, string> = {
   INVALID_REQUEST: "Fix the fields listed above and call the tool again.",
-  UNAUTHORIZED: "The API key was rejected. Check REELSDK_KEY in this MCP server's config (rk_live_ followed by 32 characters) and restart the server.",
+  UNAUTHORIZED: "The API key was rejected. Check REELSDK_KEY in this MCP server's config (rsdk_live_ followed by 32 characters) and restart the server.",
   PAYLOAD_TOO_LARGE: "Uploads are capped at 100 MB. Host the file somewhere public and pass its URL instead (URL inputs can be up to 500 MB).",
   UNSUPPORTED_LANGUAGE: "Use one of en, es, fr, ja, zh or ko.",
   CONTENT_REJECTED: "The image safety filter flagged the scenes. Try a less graphic topic or script.",

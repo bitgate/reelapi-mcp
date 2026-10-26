@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
-export const GOOD_KEY = "rk_live_0123456789abcdefghijABCDEFGHIJkl";
+export const GOOD_KEY = "rsdk_live_0123456789abcdefghijABCDEFGHIJkl";
 
 type Body = Record<string, unknown>;
 type JobStatus = "running" | "succeeded" | "failed";

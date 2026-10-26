@@ -15,7 +15,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bitgate/reelapi-mcp.git"
+    "url": "git+https://github.com/bitgate/reelsdk-mcp.git"
   },
   "homepage": "https://reelsdk.com",
   "keywords": [

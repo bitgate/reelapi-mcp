@@ -15,9 +15,9 @@ describe("loadConfig", () => {
   });
 
   it("applies defaults", () => {
-    expect(loadConfig({ REELSDK_KEY: "rk_live_x" })).toEqual({
+    expect(loadConfig({ REELSDK_KEY: "rsdk_live_x" })).toEqual({
       ok: true,
-      config: { apiKey: "rk_live_x", baseUrl: "https://api.reelsdk.com", outputDir: "reelsdk-output", waitSeconds: 50 },
+      config: { apiKey: "rsdk_live_x", baseUrl: "https://api.reelsdk.com", outputDir: "reelsdk-output", waitSeconds: 50 },
     });
   });
 
@@ -25,15 +25,6 @@ describe("loadConfig", () => {
     expect(loadConfig({ REELSDK_KEY: "k", REELSDK_WAIT_S: "900" })).toMatchObject({ ok: true, config: { waitSeconds: 300 } });
     expect(loadConfig({ REELSDK_KEY: "k", REELSDK_WAIT_S: "soon" }).ok).toBe(false);
     expect(loadConfig({ REELSDK_KEY: "k", REELSDK_BASE_URL: "ftp://example.com" }).ok).toBe(false);
-  });
-
-  it("still reads the REELAPI_* names", () => {
-    const legacy = { REELAPI_KEY: "rk_live_old", REELAPI_BASE_URL: "https://old.example.com/", REELAPI_OUTPUT_DIR: "out", REELAPI_WAIT_S: "10" };
-    expect(loadConfig(legacy)).toEqual({
-      ok: true,
-      config: { apiKey: "rk_live_old", baseUrl: "https://old.example.com", outputDir: "out", waitSeconds: 10 },
-    });
-    expect(loadConfig({ ...legacy, REELSDK_KEY: "rk_live_new" })).toMatchObject({ ok: true, config: { apiKey: "rk_live_new" } });
   });
 });
 
