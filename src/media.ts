@@ -1,7 +1,7 @@
 import { openAsBlob } from "node:fs";
 import { stat } from "node:fs/promises";
 import path from "node:path";
-import type { ReelApi, Upload } from "./api.js";
+import type { ReelSdk, Upload } from "./api.js";
 import type { ToolContext } from "./context.js";
 import { log } from "./log.js";
 import { ToolError } from "./results.js";
@@ -29,7 +29,7 @@ export class Media {
   readonly #uploads = new Map<string, CachedUpload>();
 
   constructor(
-    private readonly api: ReelApi,
+    private readonly api: ReelSdk,
     private readonly workspace: Workspace,
   ) {}
 
@@ -99,7 +99,7 @@ function publicUrl(value: string): string {
 
   const { hostname } = new URL(value);
   if (PRIVATE_HOST.test(hostname)) {
-    throw new ToolError(`reelapi downloads URL inputs over the internet and can't reach ${hostname}. Pass the local file path instead; it gets uploaded.`);
+    throw new ToolError(`reelsdk downloads URL inputs over the internet and can't reach ${hostname}. Pass the local file path instead; it gets uploaded.`);
   }
   return value;
 }

@@ -1,4 +1,4 @@
 node_modules/
-reelapi-output/
+reelsdk-output/
 *.tgz
 .DS_Store

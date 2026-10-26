@@ -58,7 +58,7 @@ export class NetworkError extends Error {
 
 const MAX_ATTEMPTS = 4;
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
-const USER_AGENT = `reelapi-mcp/${VERSION} node/${process.versions.node}`;
+const USER_AGENT = `reelsdk-mcp/${VERSION} node/${process.versions.node}`;
 
 interface Call {
   method: "GET" | "POST";
@@ -72,7 +72,7 @@ interface Call {
 
 type Body = Record<string, unknown>;
 
-export class ReelApi {
+export class ReelSdk {
   constructor(
     readonly baseUrl: string,
     private readonly apiKey: string,

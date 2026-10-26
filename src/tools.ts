@@ -196,7 +196,7 @@ export function registerTools(server: McpServer, services: () => Services, setti
     "get_job",
     {
       title: "Get job",
-      description: `Wait for a reelapi job that another tool returned as still running, then save its files locally just like the original call would have. Waits up to ${settings.waitSeconds} s per call; if it's still running, call it again. Also explains why a job failed.`,
+      description: `Wait for a reelsdk job that another tool returned as still running, then save its files locally just like the original call would have. Waits up to ${settings.waitSeconds} s per call; if it's still running, call it again. Also explains why a job failed.`,
       inputSchema: {
         job_id: z.string().regex(/^job_[a-z0-9]{20}$/, "job ids look like job_ followed by 20 lowercase letters and digits").describe("The job_id a tool returned."),
       },

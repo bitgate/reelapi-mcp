@@ -26,7 +26,7 @@ let dir: string;
 
 beforeEach(async () => {
   api = await startFakeApi();
-  dir = await mkdtemp(path.join(os.tmpdir(), "reelapi-mcp-"));
+  dir = await mkdtemp(path.join(os.tmpdir(), "reelsdk-mcp-"));
   await writeFile(path.join(dir, "clip.mp4"), "local video bytes");
 });
 
@@ -36,7 +36,7 @@ afterEach(async () => {
 });
 
 async function connect(env: Record<string, string | undefined> = {}): Promise<Client> {
-  const server = createServer({ REELAPI_KEY: GOOD_KEY, REELAPI_BASE_URL: api.baseUrl, CLAUDE_PROJECT_DIR: dir, REELAPI_WAIT_S: "30", ...env });
+  const server = createServer({ REELSDK_KEY: GOOD_KEY, REELSDK_BASE_URL: api.baseUrl, CLAUDE_PROJECT_DIR: dir, REELSDK_WAIT_S: "30", ...env });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
 
@@ -53,7 +53,7 @@ async function call(client: Client, name: string, args: Record<string, unknown>,
   return { isError: result.isError === true, text, json: start >= 0 ? JSON.parse(text.slice(start + 1)) : {} };
 }
 
-const output = (...parts: string[]) => path.join(dir, "reelapi-output", ...parts);
+const output = (...parts: string[]) => path.join(dir, "reelsdk-output", ...parts);
 const saved = (outcome: Outcome, name: string) => outcome.json.files?.find((file) => file.name === name)?.path;
 const uploadUrl = (filename: string) => api.uploads.find((upload) => upload.filename === filename)?.url;
 
@@ -134,7 +134,7 @@ describe("other tools", () => {
 describe("get_job", () => {
   it("hands back a job id when the wait runs out, then saves the files once done", async () => {
     api.scenario.pollsUntilDone = 2;
-    const client = await connect({ REELAPI_WAIT_S: "0" });
+    const client = await connect({ REELSDK_WAIT_S: "0" });
 
     const started = await call(client, "make_short", { topic: "the ghost ship Mary Celeste", captions: "none" });
     expect(started.json.status).toBe("running");
@@ -171,20 +171,20 @@ describe("errors", () => {
   });
 
   it("explains a rejected key", async () => {
-    const client = await connect({ REELAPI_KEY: "rk_live_wrong" });
+    const client = await connect({ REELSDK_KEY: "rk_live_wrong" });
     const outcome = await call(client, "make_slideshow", { images: ["https://example.com/a.jpg"] });
 
     expect(outcome.isError).toBe(true);
     expect(outcome.text).toContain("401");
-    expect(outcome.text).toContain("REELAPI_KEY");
+    expect(outcome.text).toContain("REELSDK_KEY");
   });
 
   it("asks for a key before calling the API", async () => {
-    const client = await connect({ REELAPI_KEY: undefined });
+    const client = await connect({ REELSDK_KEY: undefined });
     const outcome = await call(client, "add_captions", { video: "clip.mp4" });
 
     expect(outcome.isError).toBe(true);
-    expect(outcome.text).toContain("REELAPI_KEY is not set");
+    expect(outcome.text).toContain("REELSDK_KEY is not set");
     expect(api.requests).toHaveLength(0);
   });
 
@@ -206,7 +206,7 @@ describe("errors", () => {
     expect(api.requests).toHaveLength(0);
   });
 
-  it("rejects URLs reelapi can't reach", async () => {
+  it("rejects URLs reelsdk can't reach", async () => {
     const client = await connect();
     const outcome = await call(client, "add_captions", { video: "http://localhost:3000/clip.mp4" });
 

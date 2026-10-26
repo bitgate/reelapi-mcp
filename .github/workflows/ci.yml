@@ -24,4 +24,4 @@ jobs:
       - name: Packed CLI starts
         run: |
           npm pack
-          npx -y ./reelapi-mcp-*.tgz --version
+          npx -y ./reelsdk-mcp-*.tgz --version

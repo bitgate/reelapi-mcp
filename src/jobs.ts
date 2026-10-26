@@ -1,7 +1,7 @@
 import { mkdir, open, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import type { Job, ReelApi } from "./api.js";
+import type { Job, ReelSdk } from "./api.js";
 import type { Config } from "./config.js";
 import { elapsedSeconds, type SavedFile, type ToolContext } from "./context.js";
 import { errorMessage, log } from "./log.js";
@@ -22,7 +22,7 @@ export class JobRunner {
   readonly #tracked = new Map<string, Tracked>();
 
   constructor(
-    private readonly api: ReelApi,
+    private readonly api: ReelSdk,
     private readonly config: Config,
     private readonly workspace: Workspace,
   ) {}
@@ -75,7 +75,7 @@ export class JobRunner {
           ? await Promise.all(outputs.map(async ([name]) => (await reserve(dir, (n) => [numbered(safeName(name), n)]))[0]!))
           : await reserve(dir, (n) => plannedNames(outputs, n === 1 ? stem : `${stem}-${n}`));
     } catch (error) {
-      const reason = `couldn't write to ${dir} (${errorMessage(error)}); set REELAPI_OUTPUT_DIR to a writable folder`;
+      const reason = `couldn't write to ${dir} (${errorMessage(error)}); set REELSDK_OUTPUT_DIR to a writable folder`;
       log(reason);
       return outputs.map(([name, url]) => ({ name, url, error: reason }));
     }

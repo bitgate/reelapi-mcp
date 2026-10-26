@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Local stdio MCP server that wraps the reelapi video API. The API contract lives in the `bitgate/reelapi` repo (`docs/CONTRACT.md`, `docs/SHORTS.md`) and at https://reelapi.bitgate.dev/openapi.json.
+Local stdio MCP server that wraps the reelsdk video API. The API contract lives in the `bitgate/reelapi` repo (`docs/CONTRACT.md`, `docs/SHORTS.md`) and at https://api.reelsdk.com/openapi.json.
 
 ## Layout
 
@@ -30,4 +30,4 @@ Local stdio MCP server that wraps the reelapi video API. The API contract lives 
 npm run typecheck && npm test && npm run bundle:check
 ```
 
-Live smoke test: `npx @modelcontextprotocol/inspector -e REELAPI_KEY=rk_live_... node dist/index.js`.
+Live smoke test: `npx @modelcontextprotocol/inspector -e REELSDK_KEY=rk_live_... node dist/index.js`.
