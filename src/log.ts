@@ -1,6 +1,6 @@
 export function log(message: string, error?: unknown): void {
   const detail = error === undefined ? "" : ` ${error instanceof Error ? (error.stack ?? errorMessage(error)) : String(error)}`;
-  process.stderr.write(`[reelapi-mcp] ${message}${detail}\n`);
+  process.stderr.write(`[reelsdk-mcp] ${message}${detail}\n`);
 }
 
 export function errorMessage(error: unknown): string {

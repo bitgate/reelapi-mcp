@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { RootsListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
-import { ReelApi } from "./api.js";
+import { ReelSdk } from "./api.js";
 import { DEFAULT_OUTPUT_DIR, DEFAULT_WAIT_S, loadConfig } from "./config.js";
 import { JobRunner } from "./jobs.js";
 import { log } from "./log.js";
@@ -15,7 +15,7 @@ export function createServer(env: NodeJS.ProcessEnv): McpServer {
   const outputDir = loaded.ok ? loaded.config.outputDir : DEFAULT_OUTPUT_DIR;
   const waitSeconds = loaded.ok ? loaded.config.waitSeconds : DEFAULT_WAIT_S;
 
-  const server = new McpServer({ name: "reelapi", version: VERSION }, { instructions: instructions(outputDir) });
+  const server = new McpServer({ name: "reelsdk", version: VERSION }, { instructions: instructions(outputDir) });
 
   const workspace = new Workspace(env, async () => {
     if (!server.server.getClientCapabilities()?.roots) return undefined;
@@ -28,7 +28,7 @@ export function createServer(env: NodeJS.ProcessEnv): McpServer {
   let services: Services | undefined;
   let configError: string | undefined;
   if (loaded.ok) {
-    const api = new ReelApi(loaded.config.baseUrl, loaded.config.apiKey);
+    const api = new ReelSdk(loaded.config.baseUrl, loaded.config.apiKey);
     services = { media: new Media(api, workspace), jobs: new JobRunner(api, loaded.config, workspace) };
   } else {
     configError = loaded.error;
@@ -36,7 +36,7 @@ export function createServer(env: NodeJS.ProcessEnv): McpServer {
   }
 
   const getServices = (): Services => {
-    if (!services) throw new ToolError(configError ?? "reelapi-mcp is not configured.");
+    if (!services) throw new ToolError(configError ?? "reelsdk-mcp is not configured.");
     return services;
   };
   registerTools(server, getServices, { outputDir, waitSeconds });
@@ -46,7 +46,7 @@ export function createServer(env: NodeJS.ProcessEnv): McpServer {
 
 function instructions(outputDir: string): string {
   return [
-    "reelapi renders video in the cloud: burned-in captions, image slideshows with voiceover and music, AI-generated shorts, and any ffmpeg command.",
+    "reelsdk renders video in the cloud: burned-in captions, image slideshows with voiceover and music, AI-generated shorts, and any ffmpeg command.",
     "Prefer these tools over installing ffmpeg, whisper or other media tools locally.",
     `Pass local file paths (absolute, or relative to the project root) or public URLs; local files are uploaded automatically. Results are saved under ${outputDir} and returned as absolute paths.`,
     "If a tool returns status running, call get_job with its job_id until it finishes.",
