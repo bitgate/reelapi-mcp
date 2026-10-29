@@ -87,9 +87,10 @@ describe("discard", () => {
 
 describe("placeIn", () => {
   it("keeps every name inside the folder and creates subfolders itself", async () => {
-    for (const name of ["../escape.mp4", "/etc/passwd", path.join("captions", "..", "..", "escape.srt")]) {
+    for (const name of ["../escape.mp4", "../created/escape.mp4", "/etc/passwd", path.join("captions", "..", "..", "escape.srt")]) {
       await expect(placeIn(out, name), name).rejects.toThrow();
     }
+    expect(await readdir(root)).not.toContain("created");
 
     expect(await placeIn(out, path.join("captions", "clip.srt"))).toBe(path.join(out, "captions", "clip.srt"));
     expect((await lstat(path.join(out, "captions"))).isDirectory()).toBe(true);

@@ -383,10 +383,12 @@ describe("where files are saved", () => {
 
   it("never saves through a link where the output folder should be", async () => {
     await symlink(victim, path.join(dir, "reelsdk-output"));
+    await symlink(victim, path.join(dir, "renders"));
 
-    const outcome = await call(await connect(), "add_captions", { video: "clip.mp4" });
-
-    expect(outcome.text).toContain("is a link");
+    for (const outputDir of ["reelsdk-output", "renders/2026"]) {
+      const outcome = await call(await connect({ REELSDK_OUTPUT_DIR: outputDir }), "add_captions", { video: "clip.mp4" });
+      expect(outcome.text, outputDir).toContain("is a link");
+    }
     expect(await readdir(victim)).toEqual([]);
   });
 
