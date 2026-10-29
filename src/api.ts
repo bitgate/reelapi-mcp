@@ -261,7 +261,7 @@ async function answerText(response: Response, maxBytes: number, endpoint: string
     if (bytes > maxBytes) throw tooLarge();
     chunks.push(chunk);
   }
-  return Buffer.concat(chunks).toString("utf8");
+  return new TextDecoder().decode(Buffer.concat(chunks));
 }
 
 function sizeOf(bytes: number): string {

@@ -111,6 +111,7 @@ export async function saveExclusive(source: AsyncIterable<Uint8Array>, destinati
   const handle = await open(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0));
   try {
     await pipeline(source, handle.createWriteStream());
+    await handle.close();
     await assertUnmoved(dir);
     await rename(temp, destination);
   } catch (error) {
