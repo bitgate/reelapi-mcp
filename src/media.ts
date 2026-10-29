@@ -1,13 +1,17 @@
-import { openAsBlob } from "node:fs";
-import { stat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, realpath, stat, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import type { ReelSdk, Upload } from "./api.js";
 import type { ToolContext } from "./context.js";
 import { log } from "./log.js";
+import { hasHiddenSegment, isNetworkPath, LinkError, resolveLinks } from "./paths.js";
 import { ToolError } from "./results.js";
+import { HEAD_BYTES, isMediaHead } from "./sniff.js";
 import { resolvePath, type Workspace } from "./workspace.js";
 
 export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
+
+const OPEN_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
 
 const HTTP_URL = /^https?:\/\//i;
 const OTHER_URL = /^[a-z][a-z0-9+.-]+:\/\//i;
@@ -16,8 +20,11 @@ const REUSE_MARGIN_MS = 60 * 60 * 1000;
 
 export interface LocalFile {
   path: string;
+  realPath: string;
   size: number;
   mtimeMs: number;
+  dev: number;
+  ino: number;
 }
 
 interface CachedUpload {
@@ -44,17 +51,25 @@ export class Media {
     return upload.url;
   }
 
+  // Whatever the path, only a regular media file on this machine outside hidden folders gets uploaded, since its URL is public
   async localFile(input: string): Promise<LocalFile> {
-    const baseDir = await this.workspace.baseDir();
-    const filePath = resolvePath(input.trim(), baseDir);
+    const value = input.trim();
+    if (isNetworkPath(value)) throw new ToolError(`${value} is on another machine. Pass a file on this computer or a public http(s) URL.`);
 
-    const stats = await stat(filePath).catch((error: NodeJS.ErrnoException) => {
+    const baseDir = await this.workspace.baseDir();
+    const filePath = resolvePath(value, baseDir);
+    if (hasHiddenSegment(filePath, baseDir)) throw hiddenFile(filePath);
+
+    const realPath = await resolveLinks(filePath).catch((error: NodeJS.ErrnoException) => {
+      if (error instanceof LinkError) throw new ToolError(`Can't upload ${filePath}: ${error.message}.`);
       if (error.code === "ENOENT") {
         throw new ToolError(`File not found: ${filePath}. Relative paths resolve against ${baseDir}; pass an absolute path or a public http(s) URL.`);
       }
       throw new ToolError(`Can't read ${filePath}: ${error.message}`);
     });
+    if (hasHiddenSegment(realPath, await realpath(baseDir).catch(() => baseDir))) throw hiddenFile(filePath);
 
+    const stats = await stat(realPath);
     if (!stats.isFile()) throw new ToolError(`${filePath} is not a file.`);
     if (stats.size === 0) throw new ToolError(`${filePath} is empty.`);
     if (stats.size > MAX_UPLOAD_BYTES) {
@@ -63,7 +78,17 @@ export class Media {
       );
     }
 
-    return { path: filePath, size: stats.size, mtimeMs: stats.mtimeMs };
+    const file: LocalFile = { path: filePath, realPath, size: stats.size, mtimeMs: stats.mtimeMs, dev: stats.dev, ino: stats.ino };
+    const handle = await openUnchanged(file);
+    try {
+      const { buffer, bytesRead } = await handle.read(Buffer.alloc(HEAD_BYTES), 0, HEAD_BYTES, 0);
+      if (!isMediaHead(buffer.subarray(0, bytesRead), file.size)) {
+        throw new ToolError(`${filePath} doesn't look like a video, image, audio or subtitle file, so it isn't uploaded.`);
+      }
+    } finally {
+      await handle.close();
+    }
+    return file;
   }
 
   // Same file, same session: reuse the upload until it gets close to expiring
@@ -88,10 +113,29 @@ export class Media {
     const name = path.basename(file.path);
     ctx.progress(`uploading ${name} (${megabytes(file.size)})`);
 
-    const upload = await this.api.upload(name, await openAsBlob(file.path), ctx.signal);
-    log(`uploaded ${file.path} (${file.size} bytes)`);
-    return upload;
+    const handle = await openUnchanged(file);
+    try {
+      const upload = await this.api.upload(name, { handle, size: file.size }, ctx.signal);
+      log(`uploaded ${file.path} (${file.size} bytes)`);
+      return upload;
+    } finally {
+      await handle.close();
+    }
   }
+}
+
+// We open what we checked without following a link, and refuse it when another file took its place
+async function openUnchanged(file: LocalFile): Promise<FileHandle> {
+  const handle = await open(file.realPath, OPEN_FLAGS);
+  const now = await handle.stat();
+  if (now.isFile() && now.dev === file.dev && now.ino === file.ino && now.size === file.size && now.mtimeMs === file.mtimeMs) return handle;
+
+  await handle.close();
+  throw new ToolError(`${file.path} changed while it was being checked; try again.`);
+}
+
+function hiddenFile(filePath: string): ToolError {
+  return new ToolError(`${filePath} is hidden or inside a hidden folder, and those are never uploaded.`);
 }
 
 function publicUrl(value: string): string {

@@ -1,16 +1,16 @@
-import { mkdir, open, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, open, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { Job, ReelSdk } from "./api.js";
 import type { Config } from "./config.js";
 import { elapsedSeconds, type SavedFile, type ToolContext } from "./context.js";
 import { errorMessage, log } from "./log.js";
+import { discard, isDeviceName, isInside, placeIn, realDir } from "./paths.js";
 import { failedResult, jobAge, runningResult, succeededResult } from "./results.js";
 import { resolvePath, type Workspace } from "./workspace.js";
 
 const POLL_WAIT_S = 10;
 const SIDECARS = new Set(["transcript", "srt", "vtt", "ass"]);
-const OUTPUT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 interface Tracked {
   stem?: string;
@@ -65,28 +65,31 @@ export class JobRunner {
     const outputs = Object.entries(job.outputs);
     if (outputs.length === 0) return [];
 
-    const dir = resolvePath(this.config.outputDir, await this.workspace.baseDir());
+    const base = await this.workspace.baseDir();
+    const dir = resolvePath(this.config.outputDir, base);
     ctx.progress(`saving ${outputs.length} file(s) to ${dir}`);
 
     let targets: string[];
     try {
+      const root = await outputRoot(dir, base);
       targets =
         job.op === "ffmpeg"
-          ? await Promise.all(outputs.map(async ([name]) => (await reserve(dir, (n) => [numbered(safeName(name), n)]))[0]!))
-          : await reserve(dir, (n) => plannedNames(outputs, n === 1 ? stem : `${stem}-${n}`));
+          ? await Promise.all(outputs.map(async ([name]) => (await reserve(root, (n) => [numbered(safeName(name), n)]))[0]!))
+          : await reserve(root, (n) => plannedNames(outputs, n === 1 ? stem : `${stem}-${n}`));
     } catch (error) {
       const reason = `couldn't write to ${dir} (${errorMessage(error)}); set REELSDK_OUTPUT_DIR to a writable folder`;
       log(reason);
       return outputs.map(([name, url]) => ({ name, url, error: reason }));
     }
 
+    const budget = this.api.outputBudget();
     return Promise.all(
       outputs.map(async ([name, url], index): Promise<SavedFile> => {
         const target = targets[index]!;
         try {
-          return { name, url, path: target, bytes: await this.api.download(url, target, ctx.signal) };
+          return { name, url, path: target, bytes: await this.api.download(url, target, ctx.signal, budget) };
         } catch (error) {
-          await rm(target, { force: true });
+          await discard(target).catch(() => {});
           log(`saving ${url} failed`, error);
           return { name, url, error: `download failed: ${errorMessage(error)}` };
         }
@@ -101,18 +104,27 @@ export function plannedNames(outputs: [string, string][], stem: string): string[
     const ext = extensionOf(url);
     if (name === "transcript") return path.join("captions", `${stem}.transcript${ext}`);
     if (SIDECARS.has(name)) return path.join("captions", `${stem}${ext}`);
-    return name === "video" ? `${stem}${ext}` : `${stem}-${name}${ext}`;
+    return name === "video" ? `${stem}${ext}` : `${stem}-${safeName(name)}${ext}`;
   });
 }
 
-// Never overwrite: bump a numeric suffix until every name is free, then claim the first one atomically
-async function reserve(dir: string, candidate: (attempt: number) => string[]): Promise<string[]> {
+// A folder inside the project is walked without following any link, since the project may be a cloned repo; one named elsewhere is the user's own
+async function outputRoot(dir: string, base: string): Promise<string> {
+  const realBase = await realpath(base);
+  const project = [base, realBase].find((root) => root === dir || isInside(root, dir));
+  if (project !== undefined) return realDir(realBase, path.join(realBase, path.relative(project, dir)));
+
+  await mkdir(dir, { recursive: true });
+  return realpath(dir);
+}
+
+// Never overwrite, not even a link: bump a numeric suffix until every name is free, then claim the first one atomically
+async function reserve(root: string, candidate: (attempt: number) => string[]): Promise<string[]> {
   for (let attempt = 1; attempt < 1000; attempt++) {
-    const targets = candidate(attempt).map((name) => path.join(dir, name));
-    const taken = await Promise.all(targets.map((target) => stat(target).then(() => true, () => false)));
+    const targets = await Promise.all(candidate(attempt).map((name) => placeIn(root, name)));
+    const taken = await Promise.all(targets.map((target) => lstat(target).then(() => true, () => false)));
     if (taken.some(Boolean)) continue;
 
-    await Promise.all(targets.map((target) => mkdir(path.dirname(target), { recursive: true })));
     try {
       await (await open(targets[0]!, "wx")).close();
       return targets;
@@ -120,7 +132,7 @@ async function reserve(dir: string, candidate: (attempt: number) => string[]): P
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
   }
-  throw new Error(`no free filename left in ${dir}`);
+  throw new Error(`no free filename left in ${root}`);
 }
 
 function numbered(name: string, attempt: number): string {
@@ -129,9 +141,11 @@ function numbered(name: string, attempt: number): string {
   return `${name.slice(0, name.length - ext.length)}-${attempt}${ext}`;
 }
 
-function safeName(name: string): string {
-  if (OUTPUT_NAME.test(name)) return name;
-  return name.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^[^A-Za-z0-9]+/, "") || "output";
+// A name from the API becomes one plain file name: no folders, no leading dot, nothing Windows would trim or open as a device
+export function safeName(name: string): string {
+  const plain = name.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^[^A-Za-z0-9]+/, "").replace(/\.+$/, "");
+  if (!plain) return "output";
+  return isDeviceName(plain) ? plain.replace(/^[^.]*/, "$&_") : plain;
 }
 
 function extensionOf(url: string): string {
@@ -142,7 +156,7 @@ function extensionOf(url: string): string {
 function defaultStem(job: Job): string {
   const title = (job.result as { title?: unknown } | null | undefined)?.title;
   const slug = typeof title === "string" ? slugify(title) : "";
-  return slug ? `short-${slug}` : `${job.op}-${job.id.slice(-6)}`;
+  return slug ? `short-${slug}` : safeName(`${job.op}-${job.id.slice(-6)}`);
 }
 
 export function slugify(text: string): string {

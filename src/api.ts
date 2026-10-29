@@ -1,9 +1,8 @@
-import { createWriteStream } from "node:fs";
-import { rename, rm, stat } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { errorMessage, log } from "./log.js";
+import { saveExclusive } from "./paths.js";
 import { VERSION } from "./version.js";
 
 export type JobStatus = "queued" | "running" | "succeeded" | "failed";
@@ -56,16 +55,36 @@ export class NetworkError extends Error {
   }
 }
 
+export interface Limits {
+  outputBytes: number;
+  answerBytes: number;
+  downloadMs: number;
+}
+
+export interface OutputBudget {
+  left: number;
+}
+
+export interface UploadFile {
+  handle: FileHandle;
+  size: number;
+}
+
 const MAX_ATTEMPTS = 4;
+const MAX_REDIRECTS = 3;
+const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const USER_AGENT = `reelsdk-mcp/${VERSION} node/${process.versions.node}`;
+
+// reelsdk stores at most 2 GiB of files per job, and none of its JSON answers comes near 8 MiB
+const LIMITS: Limits = { outputBytes: 2 * 1024 ** 3, answerBytes: 8 * 1024 ** 2, downloadMs: 30 * 60_000 };
 
 interface Call {
   method: "GET" | "POST";
   path: string;
   query: Record<string, string | number>;
   json?: unknown;
-  blob?: Blob;
+  file?: UploadFile;
   signal: AbortSignal;
   timeoutMs: number;
 }
@@ -73,10 +92,15 @@ interface Call {
 type Body = Record<string, unknown>;
 
 export class ReelSdk {
+  readonly #limits: Limits;
+
   constructor(
     readonly baseUrl: string,
     private readonly apiKey: string,
-  ) {}
+    limits: Partial<Limits> = {},
+  ) {
+    this.#limits = { ...LIMITS, ...limits };
+  }
 
   // wait=0 returns the job id at once; the long waits happen on GET, which is safe to retry
   async createJob(op: string, body: Body, signal: AbortSignal): Promise<Job> {
@@ -89,31 +113,74 @@ export class ReelSdk {
     return jobFrom(await this.#call({ method: "GET", path, query: { wait: waitS }, signal, timeoutMs: (waitS + 30) * 1000 }), path);
   }
 
-  async upload(filename: string, blob: Blob, signal: AbortSignal): Promise<Upload> {
-    const data = await this.#call({ method: "POST", path: "/v1/uploads", query: { filename }, blob, signal, timeoutMs: 30 * 60_000 });
+  async upload(filename: string, file: UploadFile, signal: AbortSignal): Promise<Upload> {
+    const data = await this.#call({ method: "POST", path: "/v1/uploads", query: { filename }, file, signal, timeoutMs: 30 * 60_000 });
     if (typeof data?.url !== "string") throw new ApiError(502, "BAD_RESPONSE", "the upload response has no url", "/v1/uploads");
     return data as unknown as Upload;
   }
 
-  async download(url: string, destination: string, signal: AbortSignal): Promise<number> {
-    return this.#retrying(`GET ${url}`, signal, async () => {
-      const response = await fetch(url, { headers: { "user-agent": USER_AGENT }, signal: withTimeout(signal, 30 * 60_000) });
+  outputBudget(): OutputBudget {
+    return { left: this.#limits.outputBytes };
+  }
+
+  async download(url: string, destination: string, signal: AbortSignal, budget = this.outputBudget()): Promise<number> {
+    const deadline = withTimeout(signal, this.#limits.downloadMs);
+    const tooLarge = () => new ApiError(413, "OUTPUT_TOO_LARGE", `the job's files are over ${sizeOf(this.#limits.outputBytes)}, more than reelsdk stores`, url);
+
+    return this.#retrying(`GET ${url}`, deadline, async () => {
+      const response = await this.#fetchOutput(url, deadline);
       if (!response.ok || !response.body) {
         await response.body?.cancel();
         throw new ApiError(response.status, `HTTP_${response.status}`, `download failed with HTTP ${response.status}`, url);
       }
-
-      const partial = `${destination}.part`;
-      try {
-        await pipeline(Readable.fromWeb(response.body), createWriteStream(partial));
-        await rename(partial, destination);
-      } catch (error) {
-        await rm(partial, { force: true });
-        throw error;
+      if (Number(response.headers.get("content-length")) > budget.left) {
+        await response.body.cancel();
+        throw tooLarge();
       }
 
-      return (await stat(destination)).size;
+      // We count every byte against the job's budget, whatever Content-Length said, and hand them back if this attempt fails
+      let bytes = 0;
+      async function* counted(body: AsyncIterable<Uint8Array>): AsyncGenerator<Uint8Array> {
+        for await (const chunk of body) {
+          bytes += chunk.byteLength;
+          budget.left -= chunk.byteLength;
+          if (budget.left < 0) throw tooLarge();
+          yield chunk;
+        }
+      }
+
+      try {
+        await saveExclusive(counted(response.body), destination);
+        return bytes;
+      } catch (error) {
+        budget.left += bytes;
+        throw error;
+      }
     });
+  }
+
+  // Files only come from the API's own /f/ links, every redirect hop is held to the same rule, and the key is never sent along
+  async #fetchOutput(url: string, signal: AbortSignal): Promise<Response> {
+    let next = url;
+    for (let hops = 0; ; hops++) {
+      if (!this.#isOutputUrl(next)) throw new Error(`refused ${next}: files only download from ${this.baseUrl}/f/`);
+
+      const response = await fetch(next, { headers: { "user-agent": USER_AGENT }, redirect: "manual", signal });
+      const location = response.headers.get("location");
+      if (!REDIRECT_STATUS.has(response.status) || location === null) return response;
+
+      await response.body?.cancel();
+      if (hops === MAX_REDIRECTS) throw new Error(`refused ${url}: more than ${MAX_REDIRECTS} redirects`);
+      next = new URL(location, next).href;
+    }
+  }
+
+  #isOutputUrl(url: string): boolean {
+    if (!URL.canParse(url)) return false;
+
+    const target = new URL(url);
+    const base = new URL(this.baseUrl);
+    return target.origin === base.origin && target.pathname.startsWith(`${base.pathname.replace(/\/$/, "")}/f/`);
   }
 
   async #call(call: Call): Promise<Body | null> {
@@ -124,12 +191,13 @@ export class ReelSdk {
       const response = await fetch(url, {
         method: call.method,
         headers: this.#headers(call),
-        body: call.json === undefined ? call.blob : JSON.stringify(call.json),
+        body: call.file ? fileBody(call.file) : call.json === undefined ? undefined : JSON.stringify(call.json),
+        duplex: "half",
         signal: withTimeout(call.signal, call.timeoutMs),
       });
 
       // A failed job comes back as 422/500 with the job attached: that's an answer, not a transport error
-      const text = await response.text();
+      const text = await answerText(response, this.#limits.answerBytes, call.path);
       const data = parseObject(text);
       if (response.ok || isJob(data?.job)) return data;
 
@@ -144,7 +212,10 @@ export class ReelSdk {
       "user-agent": USER_AGENT,
     };
     if (call.json !== undefined) headers["content-type"] = "application/json";
-    if (call.blob !== undefined) headers["content-type"] = "application/octet-stream";
+    if (call.file !== undefined) {
+      headers["content-type"] = "application/octet-stream";
+      headers["content-length"] = String(call.file.size);
+    }
     return headers;
   }
 
@@ -168,6 +239,33 @@ export class ReelSdk {
       }
     }
   }
+}
+
+// Every attempt re-reads the file from the start through the handle we checked, never by its name
+function fileBody(file: UploadFile): RequestInit["body"] {
+  return Readable.toWeb(file.handle.createReadStream({ start: 0, end: file.size - 1, autoClose: false })) as unknown as RequestInit["body"];
+}
+
+// We read at most maxBytes of an answer, whatever its Content-Length claims
+async function answerText(response: Response, maxBytes: number, endpoint: string): Promise<string> {
+  const tooLarge = () => new ApiError(413, "RESPONSE_TOO_LARGE", `the answer is over ${sizeOf(maxBytes)}`, endpoint);
+  if (Number(response.headers.get("content-length")) > maxBytes) {
+    await response.body?.cancel();
+    throw tooLarge();
+  }
+
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  for await (const chunk of response.body ?? []) {
+    bytes += chunk.byteLength;
+    if (bytes > maxBytes) throw tooLarge();
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function sizeOf(bytes: number): string {
+  return bytes >= 1024 ** 3 ? `${bytes / 1024 ** 3} GiB` : `${Math.ceil(bytes / 1024 ** 2)} MiB`;
 }
 
 function withTimeout(signal: AbortSignal, ms: number): AbortSignal {

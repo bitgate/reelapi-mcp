@@ -7,6 +7,7 @@ import type { ToolContext } from "./context.js";
 import type { JobRunner } from "./jobs.js";
 import { log } from "./log.js";
 import type { Media } from "./media.js";
+import { isDeviceName } from "./paths.js";
 import { errorResult, textResult, ToolError } from "./results.js";
 
 export interface Services {
@@ -34,7 +35,10 @@ const MUSIC_MOODS = ["auto", "none", "lofi", "chill", "upbeat", "cinematic", "dr
 const PRESETS = ["bold", "karaoke", "minimal"] as const;
 
 const color = z.string().regex(/^(#?[0-9a-fA-F]{3}|#?[0-9a-fA-F]{6}|[a-zA-Z]+)$/, "use a hex color like #FFE14D or a color name");
-const fileName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, "use a bare filename like in.mp4");
+const fileName = z
+  .string()
+  .regex(/^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9_-])?$/, "use a bare filename like in.mp4")
+  .refine((name) => !isDeviceName(name), "CON, PRN, AUX, NUL, COM0-9 and LPT0-9 are devices on Windows; use another name");
 const quality = z.enum(["draft", "standard", "high"]).optional().describe("draft renders fastest, high looks best. Default standard.");
 
 export function registerTools(server: McpServer, services: () => Services, settings: ToolSettings): void {

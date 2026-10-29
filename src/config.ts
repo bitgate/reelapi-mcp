@@ -21,8 +21,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): ConfigResult {
   }
 
   const baseUrl = (env.REELSDK_BASE_URL?.trim() || DEFAULT_BASE_URL).replace(/\/+$/, "");
-  if (!URL.canParse(baseUrl) || !/^https?:$/.test(new URL(baseUrl).protocol)) {
-    problems.push(`REELSDK_BASE_URL must be an http(s) URL, got "${baseUrl}".`);
+  if (!isSafeBaseUrl(baseUrl)) {
+    problems.push(`REELSDK_BASE_URL must be an https URL (plain http only for localhost), got "${baseUrl}".`);
   }
 
   const rawWait = env.REELSDK_WAIT_S?.trim();
@@ -42,4 +42,12 @@ export function loadConfig(env: NodeJS.ProcessEnv): ConfigResult {
       waitSeconds: Math.min(MAX_WAIT_S, Math.floor(waitSeconds)),
     },
   };
+}
+
+// The key goes along with every call, so only over https, or plain http to this machine
+function isSafeBaseUrl(value: string): boolean {
+  if (!URL.canParse(value)) return false;
+
+  const { protocol, hostname } = new URL(value);
+  return protocol === "https:" || (protocol === "http:" && /^(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])$/.test(hostname));
 }

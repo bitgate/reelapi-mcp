@@ -21,13 +21,17 @@ interface Outcome {
   json: { status?: string; job_id?: string; files?: SavedFile[]; hint?: string; result?: { title?: string } };
 }
 
+const MP4 = Buffer.concat([Buffer.from("\0\0\0\x18ftypisom\0\0\x02\0isomiso2", "latin1"), Buffer.from("local video bytes")]);
+const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);
+const MP3 = Buffer.from("ID3\x04\0\0\0\0\0\0", "latin1");
+
 let api: FakeApi;
 let dir: string;
 
 beforeEach(async () => {
   api = await startFakeApi();
   dir = await mkdtemp(path.join(os.tmpdir(), "reelsdk-mcp-"));
-  await writeFile(path.join(dir, "clip.mp4"), "local video bytes");
+  await writeFile(path.join(dir, "clip.mp4"), MP4);
 });
 
 afterEach(async () => {
@@ -64,7 +68,7 @@ describe("add_captions", () => {
     const outcome = await call(client, "add_captions", { video: "clip.mp4", preset: "karaoke", highlight_color: "#00FF00" }, (message) => progress.push(message));
 
     expect(outcome.isError).toBe(false);
-    expect(api.uploads).toMatchObject([{ filename: "clip.mp4", bytes: 17 }]);
+    expect(api.uploads).toMatchObject([{ filename: "clip.mp4", bytes: MP4.length }]);
     expect(api.created).toEqual([{ op: "captions", body: { video_url: uploadUrl("clip.mp4"), style: { preset: "karaoke", highlight_color: "#00FF00" } } }]);
 
     expect(saved(outcome, "video")).toBe(output("clip-captioned.mp4"));
@@ -86,7 +90,8 @@ describe("add_captions", () => {
 
 describe("other tools", () => {
   it("make_slideshow spreads duration_s over the images and uploads local audio", async () => {
-    await Promise.all(["a.jpg", "b.jpg", "song.mp3"].map((name) => writeFile(path.join(dir, name), name)));
+    const files: [string, Buffer][] = [["a.jpg", JPEG], ["b.jpg", JPEG], ["song.mp3", MP3]];
+    await Promise.all(files.map(([name, head]) => writeFile(path.join(dir, name), Buffer.concat([head, Buffer.from(name)]))));
     const client = await connect();
     const outcome = await call(client, "make_slideshow", {
       images: ["a.jpg", "b.jpg", "https://example.com/c.jpg"],
