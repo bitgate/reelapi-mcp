@@ -7,9 +7,11 @@ Local stdio MCP server that wraps the reelsdk video API. The API contract lives 
 - `src/index.ts`: entry point, stdio transport
 - `src/server.ts`: builds the `McpServer`, project root detection, config errors
 - `src/tools.ts`: the six tools; names, descriptions and parameter docs are what agents read to pick a tool
-- `src/api.ts`: HTTP client with retries (network errors, 408/429/5xx), uploads and streamed downloads
+- `src/api.ts`: HTTP client with retries (network errors, 408/429/5xx), uploads, capped answers, and downloads from the API's own `/f/` links only
 - `src/jobs.ts`: create job, long-poll, save outputs without overwriting
-- `src/media.ts`: local path or URL to an API URL, upload cache, 100 MB check
+- `src/media.ts`: local path or URL to an API URL, upload cache, upload checks (network paths, hidden files, 100 MB, content)
+- `src/paths.ts`: network and device names, link walks, exclusive saves that stay inside a folder
+- `src/sniff.ts`: tells video, image, audio and subtitle files apart from everything else by their first bytes
 - `src/results.ts`: tool results and error hints
 - `test/`: vitest against `test/fake-api.ts`, through a real MCP client over an in-memory transport
 
@@ -23,6 +25,7 @@ Local stdio MCP server that wraps the reelsdk video API. The API contract lives 
 - `vite` is pinned to 7 in `overrides`: vite 8 crashes npm 10's installer (`Cannot read properties of null (reading 'edgesOut')`).
 - Keep tool descriptions short and concrete: what it does, when to use it instead of local ffmpeg, what comes back, how long it takes.
 - Bump `version` in `package.json` and `src/version.ts` together (a test checks they match).
+- Names from the API go through `safeName`; files are written only with `placeIn` and `saveExclusive`.
 
 ## Checks
 

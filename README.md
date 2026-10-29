@@ -97,15 +97,19 @@ Tools wait up to `REELSDK_WAIT_S` seconds, sending progress updates if your clie
 | Variable | Default | |
 | --- | --- | --- |
 | `REELSDK_KEY` | | Required. Your `rsdk_live_...` key. |
-| `REELSDK_OUTPUT_DIR` | `reelsdk-output` | Where results are saved. Relative paths resolve against the project root. |
+| `REELSDK_OUTPUT_DIR` | `reelsdk-output` | Where results are saved. Relative paths resolve against the project root and may not pass through a link; use an absolute path to save elsewhere. |
 | `REELSDK_WAIT_S` | `50` | Seconds a tool waits for its job before handing back a `job_id` (0-300). Keep it under your client's tool timeout. |
-| `REELSDK_BASE_URL` | `https://api.reelsdk.com` | API endpoint. |
+| `REELSDK_BASE_URL` | `https://api.reelsdk.com` | API endpoint. https only; plain http only for localhost. |
 
 The project root is `CLAUDE_PROJECT_DIR` when Claude Code sets it, else the client's first workspace root, else the directory the server was started in.
 
 ## Limits
 
-Local files up to 100 MB (pass a public URL for bigger inputs, up to 500 MB). Up to 15 minutes of media and 10 minutes of processing per job.
+Local files up to 100 MB (pass a public URL for bigger inputs, up to 500 MB). Up to 15 minutes of media and 10 minutes of processing per job, and up to 2 GiB of saved files per job.
+
+A local file is only uploaded when it starts like a video, image, audio or subtitle file. Hidden files, anything in a hidden folder (`.env`, `~/.ssh`) and paths on another machine (`\\server\share`) are refused.
+
+Results are only downloaded from the API's own `/f/` links, and never saved through a link inside the project or the output folder. Node can't open or rename relative to a folder handle, so another program running as you could still swap the folder for a link between the last check and the final rename.
 
 ## Development
 
