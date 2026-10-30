@@ -106,9 +106,11 @@ function describeError(error: unknown): string {
 
   if (error instanceof ApiError) {
     const lines = [
-      error.issues.length > 0
-        ? `reelsdk rejected the request (HTTP ${error.status} ${error.code}):`
-        : `reelsdk returned HTTP ${error.status} ${error.code}: ${error.message}`,
+      error.status === 0
+        ? `reelsdk-mcp refused reelsdk's answer (${error.code}): ${error.message}`
+        : error.issues.length > 0
+          ? `reelsdk rejected the request (HTTP ${error.status} ${error.code}):`
+          : `reelsdk returned HTTP ${error.status} ${error.code}: ${error.message}`,
       ...error.issues.map((issue) => `- ${issue.path || "body"}: ${issue.message}`),
     ];
     const hint = hintFor(error.code, error.status, error.endpoint);

@@ -152,11 +152,19 @@ describe("job answers", () => {
     await expect(sdk.getJob("job_1", 0, signal())).resolves.toMatchObject({ status: "running", outputs: {} });
   });
 
-  it("refuse a job with more than 20 files", async () => {
+  it("refuse a job with more than 20 files, without blaming reelsdk", async () => {
     const sdk = new ReelSdk(await listen(), KEY);
     answers.push(answer({ outputs: outputs(20) }), answer({ outputs: outputs(21) }));
 
     await expect(sdk.getJob("job_1", 0, signal())).resolves.toMatchObject({ status: "succeeded" });
-    await expect(sdk.getJob("job_1", 0, signal())).rejects.toMatchObject({ code: "TOO_MANY_OUTPUTS" });
+    const error = await failure(sdk.getJob("job_1", 0, signal()));
+
+    expect(error).toMatchObject({ code: "TOO_MANY_OUTPUTS" });
+    expect(errorResult(error).content).toEqual([
+      {
+        type: "text",
+        text: "reelsdk-mcp refused reelsdk's answer (TOO_MANY_OUTPUTS): the job lists 21 files, and reelsdk-mcp saves at most 20\nGet this job from the reelsdk API directly for all of its links.",
+      },
+    ]);
   });
 });

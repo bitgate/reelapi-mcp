@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ReelSdk } from "../src/api.js";
+import { errorResult } from "../src/results.js";
 
 interface Host {
   url: string;
@@ -211,7 +212,10 @@ describe("answers", () => {
       res.end(`${"x".repeat(1000)}"}}`);
     };
 
-    await expect(sdk.getJob("job_1", 0, signal())).rejects.toMatchObject({ code: "RESPONSE_TOO_LARGE" });
+    const error = await sdk.getJob("job_1", 0, signal()).catch((error: unknown) => error);
+
+    expect(error).toMatchObject({ code: "RESPONSE_TOO_LARGE" });
+    expect(errorResult(error).content).toEqual([{ type: "text", text: "reelsdk-mcp refused reelsdk's answer (RESPONSE_TOO_LARGE): the answer is over 1 MiB" }]);
   });
 
   it("refuses an answer that says it's over the cap before reading it", { timeout: 3000 }, async () => {

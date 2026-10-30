@@ -323,7 +323,7 @@ function fileBody(file: UploadFile): RequestInit["body"] {
 
 // We read at most maxBytes of an answer, whatever its Content-Length claims
 async function answerText(response: Response, maxBytes: number, endpoint: string, requestId: string | undefined): Promise<string> {
-  const tooLarge = () => new ApiError(413, "RESPONSE_TOO_LARGE", `the answer is over ${sizeOf(maxBytes)}`, endpoint, { requestId });
+  const tooLarge = () => refused("RESPONSE_TOO_LARGE", `the answer is over ${sizeOf(maxBytes)}`, endpoint, requestId);
   if (Number(response.headers.get("content-length")) > maxBytes) {
     await response.body?.cancel();
     throw tooLarge();
@@ -407,9 +407,7 @@ function jobFrom({ data, requestId }: Answer, endpoint: string): Job {
   if (!isOutputMap(outputs)) throw badResponse("the job's outputs are not a map of names to links", endpoint, requestId);
 
   const count = Object.keys(outputs).length;
-  if (count > MAX_OUTPUTS) {
-    throw new ApiError(502, "TOO_MANY_OUTPUTS", `the job lists ${count} files, and reelsdk-mcp saves at most ${MAX_OUTPUTS}`, endpoint, { requestId });
-  }
+  if (count > MAX_OUTPUTS) throw refused("TOO_MANY_OUTPUTS", `the job lists ${count} files, and reelsdk-mcp saves at most ${MAX_OUTPUTS}`, endpoint, requestId);
   return { ...job, outputs };
 }
 
@@ -420,6 +418,11 @@ function isOutputMap(value: unknown): value is Record<string, string> {
 
 function badResponse(message: string, endpoint: string, requestId: string | undefined): ApiError {
   return new ApiError(502, "BAD_RESPONSE", message, endpoint, { requestId });
+}
+
+// Status 0: reelsdk-mcp turned the answer down itself, so there is no HTTP status to show
+function refused(code: string, message: string, endpoint: string, requestId: string | undefined): ApiError {
+  return new ApiError(0, code, message, endpoint, { requestId });
 }
 
 function isIssue(value: unknown): value is Issue {
