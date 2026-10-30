@@ -17,7 +17,13 @@ const SIDECARS = new Set(["transcript", "srt", "vtt", "ass"]);
 interface Tracked {
   stem?: string;
   job?: Job;
-  saved?: Promise<SavedFile[]>;
+  save?: SharedSave;
+}
+
+interface SharedSave {
+  files: Promise<SavedFile[]>;
+  stop: AbortController;
+  waiting: number;
 }
 
 export class JobRunner {
@@ -38,7 +44,7 @@ export class JobRunner {
 
   async resume(jobId: string, ctx: ToolContext): Promise<CallToolResult> {
     const tracked = this.#tracked.get(jobId);
-    if (tracked?.job && tracked.saved) return succeededResult(tracked.job, await tracked.saved, ctx);
+    if (tracked?.job && tracked.save) return succeededResult(tracked.job, await waitFor(tracked.save, ctx), ctx);
     return this.#follow(await this.api.getJob(jobId, 0, ctx.signal), ctx);
   }
 
@@ -59,15 +65,29 @@ export class JobRunner {
 
     // Calls that find the job done at the same time share one save
     const tracked = this.#tracked.get(job.id) ?? {};
-    if (!tracked.job || !tracked.saved) {
+    if (!tracked.job || !tracked.save) {
       tracked.job = job;
-      tracked.saved = this.#save(job, tracked.stem ?? defaultStem(job), ctx).catch((error: unknown) => {
-        tracked.saved = undefined;
-        throw error;
-      });
+      tracked.save = this.#startSave(job, tracked, ctx);
       this.#tracked.set(job.id, tracked);
     }
-    return succeededResult(tracked.job, await tracked.saved, ctx);
+    return succeededResult(tracked.job, await waitFor(tracked.save, ctx), ctx);
+  }
+
+  // The save runs on its own signal, not on the call that started it.
+  // One that threw or saved nothing is dropped, so the next call tries again
+  #startSave(job: Job, tracked: Tracked, ctx: ToolContext): SharedSave {
+    const stop = new AbortController();
+    const files = this.#save(job, tracked.stem ?? defaultStem(job), { ...ctx, signal: stop.signal }).then(
+      (saved) => {
+        if (!saved.some((file) => file.path)) tracked.save = undefined;
+        return saved;
+      },
+      (error: unknown) => {
+        tracked.save = undefined;
+        throw error;
+      },
+    );
+    return { files, stop, waiting: 0 };
   }
 
   async #save(job: Job, stem: string, ctx: ToolContext): Promise<SavedFile[]> {
@@ -185,6 +205,25 @@ function firstClash(names: string[]): string | undefined {
     seen.add(folded);
   }
   return undefined;
+}
+
+// A cancelled call stops waiting at once; the save stops when the last call waiting on it is cancelled
+async function waitFor(save: SharedSave, ctx: ToolContext): Promise<SavedFile[]> {
+  let stopWaiting!: () => void;
+  const cancelled = new Promise<never>((_, reject) => {
+    stopWaiting = () => reject(new DOMException("This operation was aborted", "AbortError"));
+  });
+  ctx.signal.addEventListener("abort", stopWaiting);
+  if (ctx.signal.aborted) stopWaiting();
+
+  save.waiting += 1;
+  try {
+    return await Promise.race([save.files, cancelled]);
+  } finally {
+    ctx.signal.removeEventListener("abort", stopWaiting);
+    save.waiting -= 1;
+    if (save.waiting === 0 && ctx.signal.aborted) save.stop.abort();
+  }
 }
 
 // At most `width` at once, results in order

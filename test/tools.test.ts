@@ -10,6 +10,7 @@ import { ReelSdk } from "../src/api.js";
 import type { ToolContext } from "../src/context.js";
 import { JobRunner } from "../src/jobs.js";
 import { MAX_UPLOAD_BYTES, Media } from "../src/media.js";
+import { errorResult } from "../src/results.js";
 import { createServer } from "../src/server.js";
 import { Workspace } from "../src/workspace.js";
 import { GOOD_KEY, startFakeApi, type FakeApi } from "./fake-api.js";
@@ -202,6 +203,90 @@ describe("get_job", () => {
     expect(saved(first!, "video")).toBe(output("short-the-ghost-ship.mp4"));
     expect(saved(second!, "video")).toBe(output("short-the-ghost-ship.mp4"));
     expect(api.downloads).toHaveLength(5);
+  });
+
+  const runnerFor = (outputDir = output()) => new JobRunner(new ReelSdk(api.baseUrl, GOOD_KEY), { apiKey: GOOD_KEY, baseUrl: api.baseUrl, outputDir, waitSeconds: 30 }, workspace());
+
+  // Two calls wait on one save that the first one started, while every download hangs until released
+  async function sharedSave() {
+    const job = await new ReelSdk(api.baseUrl, GOOD_KEY).createJob("captions", { video_url: "https://example.com/clip.mp4" }, context().signal);
+    const runner = runnerFor();
+
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    const dropped: string[] = [];
+    api.scenario.onFile = async (pathname, res) => {
+      res.on("close", () => {
+        if (!res.writableFinished) dropped.push(pathname);
+      });
+      await released;
+      if (!res.destroyed) res.end(`bytes of ${pathname}`);
+      return true;
+    };
+    onTestFinished(release);
+
+    const calls = [new AbortController(), new AbortController()];
+    const first = runner.resume(job.id, { ...context(), signal: calls[0]!.signal });
+    await vi.waitFor(() => expect(api.downloads).toHaveLength(4));
+    const second = runner.resume(job.id, { ...context(), signal: calls[1]!.signal });
+    return { job, calls, settled: Promise.allSettled([first, second]), release, dropped };
+  }
+
+  it("keeps saving for the other calls when the call that started the save is cancelled", async () => {
+    const { job, calls, settled, release, dropped } = await sharedSave();
+
+    calls[0]!.abort("the client went away");
+    release();
+    const [cancelled, waited] = await settled;
+
+    expect(cancelled).toMatchObject({ status: "rejected", reason: { name: "AbortError" } });
+    expect(errorResult((cancelled as PromiseRejectedResult).reason).content).toEqual([{ type: "text", text: "Cancelled." }]);
+    const outcome = outcomeOf((waited as PromiseFulfilledResult<CallToolResult>).value);
+    expect(outcome.json.files?.filter((file) => file.path)).toHaveLength(5);
+    expect(await readFile(saved(outcome, "video")!, "utf8")).toBe(`bytes of /f/out/${job.id}/video.mp4`);
+    expect(dropped).toEqual([]);
+  });
+
+  it("stops the save once every call waiting on it is cancelled", async () => {
+    const { calls, settled, dropped } = await sharedSave();
+
+    for (const call of calls) call.abort("the client went away");
+    await vi.waitFor(() => expect(dropped).toHaveLength(4));
+
+    expect(await settled).toMatchObject([
+      { status: "rejected", reason: { name: "AbortError" } },
+      { status: "rejected", reason: { name: "AbortError" } },
+    ]);
+    await vi.waitFor(async () => expect(await readdir(output(), { recursive: true })).toEqual(["captions"]));
+  });
+
+  it("tries a save again when it saved nothing", async () => {
+    await writeFile(path.join(dir, "blocked"), "");
+    const runner = runnerFor(path.join(dir, "blocked"));
+
+    const refused = outcomeOf(await runner.start("captions", { video_url: "https://example.com/clip.mp4" }, "clip", context()));
+    expect(refused.json.files?.map((file) => file.error)).toEqual(Array(5).fill(expect.stringMatching(/^couldn't write to /)));
+
+    await rm(path.join(dir, "blocked"));
+    const retried = outcomeOf(await runner.resume(refused.json.job_id!, context()));
+    expect(saved(retried, "video")).toBe(path.join(dir, "blocked", "clip.mp4"));
+  });
+
+  it("keeps a save that saved some of the files", async () => {
+    api.scenario.onFile = (pathname, res) => {
+      if (!pathname.endsWith("/captions.srt")) return false;
+      res.writeHead(404).end();
+      return true;
+    };
+    const runner = runnerFor();
+
+    const partial = outcomeOf(await runner.start("captions", { video_url: "https://example.com/clip.mp4" }, "clip", context()));
+    const requests = api.requests.length;
+    const again = outcomeOf(await runner.resume(partial.json.job_id!, context()));
+
+    expect(partial.json.files?.filter((file) => file.path)).toHaveLength(4);
+    expect(again.json.files).toEqual(partial.json.files);
+    expect(api.requests).toHaveLength(requests);
   });
 });
 
