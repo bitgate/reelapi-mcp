@@ -3,8 +3,9 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { CallToolResult, ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod";
+import { MAX_OUTPUTS } from "./api.js";
 import type { ToolContext } from "./context.js";
-import type { JobRunner } from "./jobs.js";
+import { safeName, type JobRunner } from "./jobs.js";
 import { log } from "./log.js";
 import type { Media } from "./media.js";
 import { isDeviceName } from "./paths.js";
@@ -182,7 +183,7 @@ export function registerTools(server: McpServer, services: () => Services, setti
         args: z
           .union([z.array(z.string()).min(1).max(1000), z.string().min(1)])
           .describe("Arguments after `ffmpeg`, preferably as an array. No shell; refer to inputs and outputs by bare filename."),
-        outputs: z.array(fileName).min(1).max(20).describe('Files your args write that should come back, e.g. ["out.mp4"].'),
+        outputs: z.array(fileName).min(1).max(MAX_OUTPUTS).describe('Files your args write that should come back, e.g. ["out.mp4"].'),
         timeout_s: z.number().int().min(1).max(600).optional().describe("Stop ffmpeg after this many seconds, max 600."),
       },
       annotations: opHints,
@@ -258,8 +259,7 @@ function stemOf(input: string): string {
   const value = input.trim();
   const raw = /^https?:\/\//i.test(value) && URL.canParse(value) ? safeDecode(new URL(value).pathname) : value;
   const base = path.basename(raw);
-  const stem = base.slice(0, base.length - path.extname(base).length);
-  return stem.replace(/[<>:"/\\|?*\u0000-\u001f]+/g, "-").trim().slice(0, 80) || "video";
+  return safeName(base.slice(0, base.length - path.extname(base).length));
 }
 
 function safeDecode(value: string): string {

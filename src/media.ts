@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { open, realpath, stat, type FileHandle } from "node:fs/promises";
+import { lstat, open, realpath, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import type { ReelSdk, Upload } from "./api.js";
 import type { ToolContext } from "./context.js";
@@ -60,16 +60,19 @@ export class Media {
     const filePath = resolvePath(value, baseDir);
     if (hasHiddenSegment(filePath, baseDir)) throw hiddenFile(filePath);
 
-    const realPath = await resolveLinks(filePath).catch((error: NodeJS.ErrnoException) => {
+    const unreadable = (error: NodeJS.ErrnoException): never => {
       if (error instanceof LinkError) throw new ToolError(`Can't upload ${filePath}: ${error.message}.`);
       if (error.code === "ENOENT") {
         throw new ToolError(`File not found: ${filePath}. Relative paths resolve against ${baseDir}; pass an absolute path or a public http(s) URL.`);
       }
       throw new ToolError(`Can't read ${filePath}: ${error.message}`);
-    });
+    };
+    const realPath = await resolveLinks(filePath).catch(unreadable);
     if (hasHiddenSegment(realPath, await realpath(baseDir).catch(() => baseDir))) throw hiddenFile(filePath);
 
-    const stats = await stat(realPath);
+    // lstat, so the identity we check later is never that of a file a link leads to
+    const stats = await lstat(realPath).catch(unreadable);
+    if (stats.isSymbolicLink()) throw changed(filePath);
     if (!stats.isFile()) throw new ToolError(`${filePath} is not a file.`);
     if (stats.size === 0) throw new ToolError(`${filePath} is empty.`);
     if (stats.size > MAX_UPLOAD_BYTES) {
@@ -124,14 +127,20 @@ export class Media {
   }
 }
 
-// We open what we checked without following a link, and refuse it when another file took its place
+// We open what we checked, without following a link where the system can refuse one (Windows can't), and refuse it when
+// another file took its place: by identity, and by path, since a parent folder swapped for a link fools lstat and open alike
 async function openUnchanged(file: LocalFile): Promise<FileHandle> {
   const handle = await open(file.realPath, OPEN_FLAGS);
   const now = await handle.stat();
-  if (now.isFile() && now.dev === file.dev && now.ino === file.ino && now.size === file.size && now.mtimeMs === file.mtimeMs) return handle;
+  const samePath = await realpath(file.realPath).then((real) => real === file.realPath, () => false);
+  if (samePath && now.isFile() && now.dev === file.dev && now.ino === file.ino && now.size === file.size && now.mtimeMs === file.mtimeMs) return handle;
 
   await handle.close();
-  throw new ToolError(`${file.path} changed while it was being checked; try again.`);
+  throw changed(file.path);
+}
+
+function changed(filePath: string): ToolError {
+  return new ToolError(`${filePath} changed while it was being checked; try again.`);
 }
 
 function hiddenFile(filePath: string): ToolError {

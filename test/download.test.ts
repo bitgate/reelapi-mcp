@@ -41,7 +41,7 @@ beforeEach(async () => {
   api = await startHost();
   other = await startHost();
   out = await realpath(await mkdtemp(path.join(os.tmpdir(), "reelsdk-download-")));
-  sdk = new ReelSdk(api.url, "rsdk_live_secret", { outputBytes: 1024, answerBytes: 512, downloadMs: 1500 });
+  sdk = new ReelSdk(api.url, "rsdk_live_secret", { outputBytes: 1024, answerBytes: 512, idleMs: 300, bytesPerSecond: 256 });
 });
 
 afterEach(async () => {
@@ -50,12 +50,13 @@ afterEach(async () => {
 });
 
 const signal = () => new AbortController().signal;
+const budget = () => sdk.outputBudget();
 const file = (name = "video.mp4") => path.join(out, name);
 const outputUrl = (name = "video.mp4") => `${api.url}/f/out/job_1/${name}`;
 
 describe("downloads", () => {
   it("saves a file from the API's /f/ links without sending the key", async () => {
-    expect(await sdk.download(outputUrl(), file(), signal())).toBe(10);
+    expect(await sdk.download(outputUrl(), file(), signal(), budget())).toBe(10);
 
     expect(await readFile(file(), "utf8")).toBe("file bytes");
     expect(api.hits).toEqual([{ path: "/f/out/job_1/video.mp4", authorization: undefined }]);
@@ -72,7 +73,7 @@ describe("downloads", () => {
       "file:///etc/passwd",
     ];
     for (const url of urls) {
-      await expect(sdk.download(url, file(), signal()), url).rejects.toThrow(/refused/);
+      await expect(sdk.download(url, file(), signal(), budget()), url).rejects.toThrow(/refused/);
     }
 
     expect(api.hits).toEqual([]);
@@ -84,7 +85,7 @@ describe("downloads", () => {
     other.handle = (_req, res) => res.end("internal secrets");
     for (const location of [`${other.url}/f/out/job_1/video.mp4`, "/v1/jobs/job_1"]) {
       api.handle = (_req, res) => res.writeHead(302, { location }).end();
-      await expect(sdk.download(outputUrl(), file(), signal()), location).rejects.toThrow(/refused/);
+      await expect(sdk.download(outputUrl(), file(), signal(), budget()), location).rejects.toThrow(/refused/);
     }
 
     expect(other.hits).toEqual([]);
@@ -95,14 +96,14 @@ describe("downloads", () => {
   it("follows a redirect that stays on the API's /f/ links", async () => {
     api.handle = (req, res) => (req.url === "/f/out/job_1/video.mp4" ? res.writeHead(307, { location: "/f/out/job_1/moved.mp4" }).end() : res.end("moved"));
 
-    expect(await sdk.download(outputUrl(), file(), signal())).toBe(5);
+    expect(await sdk.download(outputUrl(), file(), signal(), budget())).toBe(5);
     expect(await readFile(file(), "utf8")).toBe("moved");
   });
 
   it("gives up after a few redirects", async () => {
     api.handle = (req, res) => res.writeHead(302, { location: `${req.url}x` }).end();
 
-    await expect(sdk.download(outputUrl(), file(), signal())).rejects.toThrow(/more than 3 redirects/);
+    await expect(sdk.download(outputUrl(), file(), signal(), budget())).rejects.toThrow(/more than 3 redirects/);
     expect(api.hits).toHaveLength(4);
   });
 
@@ -110,7 +111,7 @@ describe("downloads", () => {
     api.handle = (_req, res) => res.writeHead(200, { "content-length": String(2 ** 30) }).write("x");
     const started = Date.now();
 
-    await expect(sdk.download(outputUrl(), file(), signal())).rejects.toMatchObject({ code: "OUTPUT_TOO_LARGE" });
+    await expect(sdk.download(outputUrl(), file(), signal(), budget())).rejects.toMatchObject({ code: "OUTPUT_TOO_LARGE" });
     expect(Date.now() - started).toBeLessThan(1000);
     expect(await readdir(out)).toEqual([]);
   });
@@ -121,7 +122,7 @@ describe("downloads", () => {
       res.end("y".repeat(800));
     };
 
-    await expect(sdk.download(outputUrl(), file(), signal())).rejects.toMatchObject({ code: "OUTPUT_TOO_LARGE" });
+    await expect(sdk.download(outputUrl(), file(), signal(), budget())).rejects.toMatchObject({ code: "OUTPUT_TOO_LARGE" });
     expect(await readdir(out)).toEqual([]);
   });
 
@@ -141,18 +142,55 @@ describe("downloads", () => {
       setTimeout(() => res.destroy(), 50);
     };
 
-    expect(await sdk.download(outputUrl(), file(), signal())).toBe(700);
+    expect(await sdk.download(outputUrl(), file(), signal(), budget())).toBe(700);
     expect(api.hits).toHaveLength(2);
   });
 
-  it("gives a stalled download one deadline for all its attempts", async () => {
-    api.handle = (_req, res) => res.writeHead(200).write("x");
+  it("stops a download that goes quiet, without retrying it", async () => {
+    api.handle = (_req, res) => res.writeHead(200, { "content-length": "100" }).write("x");
     const started = Date.now();
 
-    await expect(sdk.download(outputUrl(), file(), signal())).rejects.toThrow();
-    expect(Date.now() - started).toBeLessThan(2500);
+    await expect(sdk.download(outputUrl(), file(), signal(), budget())).rejects.toMatchObject({ code: "DOWNLOAD_TIMEOUT", message: "no data for 0.3 s" });
+    expect(Date.now() - started).toBeLessThan(600);
     expect(api.hits).toHaveLength(1);
     expect(await readdir(out)).toEqual([]);
+  });
+
+  it("stops a download that trickles past the time its size allows", { timeout: 4000 }, async () => {
+    sdk = new ReelSdk(api.url, "rsdk_live_secret", { outputBytes: 1024, idleMs: 300, bytesPerSecond: 2000 });
+    api.handle = (_req, res) => {
+      res.writeHead(200, { "content-length": "1000" });
+      const timer = setInterval(() => res.write("x".repeat(20)), 100);
+      res.on("close", () => clearInterval(timer));
+    };
+    const started = Date.now();
+
+    await expect(sdk.download(outputUrl(), file(), signal(), budget())).rejects.toMatchObject({ code: "DOWNLOAD_TIMEOUT", message: "not done after 1 s" });
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(await readdir(out)).toEqual([]);
+  });
+
+  it("gives a slow but steady download the time its size needs", async () => {
+    sdk = new ReelSdk(api.url, "rsdk_live_secret", { outputBytes: 1024, idleMs: 300, bytesPerSecond: 500 });
+    api.handle = (_req, res) => {
+      res.writeHead(200, { "content-length": "1000" });
+      let chunks = 0;
+      const timer = setInterval(() => {
+        chunks += 1;
+        if (chunks < 10) return void res.write("x".repeat(100));
+        clearInterval(timer);
+        res.end("x".repeat(100));
+      }, 100);
+      res.on("close", () => clearInterval(timer));
+    };
+
+    expect(await sdk.download(outputUrl(), file(), signal(), budget())).toBe(1000);
+  });
+
+  it("takes the job's budget from its caller", () => {
+    // @ts-expect-error every file of a job counts against the same budget
+    const unbudgeted = () => sdk.download(outputUrl(), file(), signal());
+    expect(unbudgeted).toBeTypeOf("function");
   });
 });
 

@@ -140,7 +140,7 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
 
 function send(res: ServerResponse, status: number, body: Body | string): void {
   const text = typeof body === "string" ? body : JSON.stringify(body);
-  res.writeHead(status, { "content-type": typeof body === "string" ? "text/plain" : "application/json" });
+  res.writeHead(status, { "content-type": typeof body === "string" ? "text/plain" : "application/json", "request-id": `req_${token(16)}` });
   res.end(text);
 }
 

@@ -1,21 +1,23 @@
 import { lstat, mkdir, open, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import type { Job, ReelSdk } from "./api.js";
+import { displayUrl, type Job, type ReelSdk } from "./api.js";
 import type { Config } from "./config.js";
 import { elapsedSeconds, type SavedFile, type ToolContext } from "./context.js";
 import { errorMessage, log } from "./log.js";
 import { discard, isDeviceName, isInside, placeIn, realDir } from "./paths.js";
-import { failedResult, jobAge, runningResult, succeededResult } from "./results.js";
+import { failedResult, fileError, jobAge, runningResult, succeededResult } from "./results.js";
 import { resolvePath, type Workspace } from "./workspace.js";
 
 const POLL_WAIT_S = 10;
+const PARALLEL_DOWNLOADS = 4;
+const MAX_NAME = 64;
 const SIDECARS = new Set(["transcript", "srt", "vtt", "ass"]);
 
 interface Tracked {
   stem?: string;
   job?: Job;
-  files?: SavedFile[];
+  saved?: Promise<SavedFile[]>;
 }
 
 export class JobRunner {
@@ -36,7 +38,7 @@ export class JobRunner {
 
   async resume(jobId: string, ctx: ToolContext): Promise<CallToolResult> {
     const tracked = this.#tracked.get(jobId);
-    if (tracked?.job && tracked.files) return succeededResult(tracked.job, tracked.files, ctx);
+    if (tracked?.job && tracked.saved) return succeededResult(tracked.job, await tracked.saved, ctx);
     return this.#follow(await this.api.getJob(jobId, 0, ctx.signal), ctx);
   }
 
@@ -55,10 +57,17 @@ export class JobRunner {
     log(`${job.op} job ${job.id} ${job.status}`);
     if (job.status === "failed") return failedResult(job);
 
+    // Calls that find the job done at the same time share one save
     const tracked = this.#tracked.get(job.id) ?? {};
-    const files = await this.#save(job, tracked.stem ?? defaultStem(job), ctx);
-    this.#tracked.set(job.id, { ...tracked, job, files });
-    return succeededResult(job, files, ctx);
+    if (!tracked.job || !tracked.saved) {
+      tracked.job = job;
+      tracked.saved = this.#save(job, tracked.stem ?? defaultStem(job), ctx).catch((error: unknown) => {
+        tracked.saved = undefined;
+        throw error;
+      });
+      this.#tracked.set(job.id, tracked);
+    }
+    return succeededResult(tracked.job, await tracked.saved, ctx);
   }
 
   async #save(job: Job, stem: string, ctx: ToolContext): Promise<SavedFile[]> {
@@ -69,6 +78,15 @@ export class JobRunner {
     const dir = resolvePath(this.config.outputDir, base);
     ctx.progress(`saving ${outputs.length} file(s) to ${dir}`);
 
+    const failAll = (reason: string): SavedFile[] => {
+      log(reason);
+      return outputs.map(([name, url]) => ({ name, url: displayUrl(url), error: reason }));
+    };
+
+    // Names that differ only in case are one file on macOS and Windows, and would keep bumping each other's number
+    const clash = job.op === "ffmpeg" ? undefined : firstClash(plannedNames(outputs, stem));
+    if (clash !== undefined) return failAll(`two of the job's files would both be saved as ${clash}`);
+
     let targets: string[];
     try {
       const root = await outputRoot(dir, base);
@@ -77,24 +95,20 @@ export class JobRunner {
           ? await Promise.all(outputs.map(async ([name]) => (await reserve(root, (n) => [numbered(safeName(name), n)]))[0]!))
           : await reserve(root, (n) => plannedNames(outputs, n === 1 ? stem : `${stem}-${n}`));
     } catch (error) {
-      const reason = `couldn't write to ${dir} (${errorMessage(error)}); set REELSDK_OUTPUT_DIR to a writable folder`;
-      log(reason);
-      return outputs.map(([name, url]) => ({ name, url, error: reason }));
+      return failAll(`couldn't write to ${dir} (${errorMessage(error)}); set REELSDK_OUTPUT_DIR to a writable folder`);
     }
 
     const budget = this.api.outputBudget();
-    return Promise.all(
-      outputs.map(async ([name, url], index): Promise<SavedFile> => {
-        const target = targets[index]!;
-        try {
-          return { name, url, path: target, bytes: await this.api.download(url, target, ctx.signal, budget) };
-        } catch (error) {
-          await discard(target).catch(() => {});
-          log(`saving ${url} failed`, error);
-          return { name, url, error: `download failed: ${errorMessage(error)}` };
-        }
-      }),
-    );
+    return mapLimited(outputs, PARALLEL_DOWNLOADS, async ([name, url], index): Promise<SavedFile> => {
+      const target = targets[index]!;
+      try {
+        return { name, url: displayUrl(url), path: target, bytes: await this.api.download(url, target, ctx.signal, budget) };
+      } catch (error) {
+        await discard(target).catch(() => {});
+        log(`saving ${displayUrl(url)} failed`, error);
+        return { name, url: displayUrl(url), error: fileError(error) };
+      }
+    });
   }
 }
 
@@ -118,21 +132,59 @@ async function outputRoot(dir: string, base: string): Promise<string> {
   return realpath(dir);
 }
 
-// Never overwrite, not even a link: bump a numeric suffix until every name is free, then claim the first one atomically
+// Never overwrite, not even a link: bump a numeric suffix until every name is ours. Each one is claimed as an empty file,
+// which no other call can claim too, and which only its own download replaces
 async function reserve(root: string, candidate: (attempt: number) => string[]): Promise<string[]> {
   for (let attempt = 1; attempt < 1000; attempt++) {
     const targets = await Promise.all(candidate(attempt).map((name) => placeIn(root, name)));
     const taken = await Promise.all(targets.map((target) => lstat(target).then(() => true, () => false)));
     if (taken.some(Boolean)) continue;
 
-    try {
-      await (await open(targets[0]!, "wx")).close();
-      return targets;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    }
+    const claims = await Promise.allSettled(targets.map(claim));
+    if (claims.every(isClaimed)) return targets;
+
+    // Someone else got one of the names first, so we give back the ones we got
+    await Promise.all(targets.filter((_, index) => isClaimed(claims[index])).map((target) => discard(target).catch(() => {})));
+    const failure = claims.find((result) => result.status === "rejected");
+    if (failure) throw failure.reason;
   }
   throw new Error(`no free filename left in ${root}`);
+}
+
+// O_EXCL creates the name or fails, and never follows or replaces what is already there
+async function claim(target: string): Promise<boolean> {
+  try {
+    await (await open(target, "wx")).close();
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+}
+
+function isClaimed(result: PromiseSettledResult<boolean> | undefined): boolean {
+  return result?.status === "fulfilled" && result.value;
+}
+
+function firstClash(names: string[]): string | undefined {
+  const seen = new Set<string>();
+  for (const name of names) {
+    const folded = name.toLowerCase();
+    if (seen.has(folded)) return name;
+    seen.add(folded);
+  }
+  return undefined;
+}
+
+// At most `width` at once, results in order
+async function mapLimited<T, R>(items: T[], width: number, work: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (let index = next++; index < items.length; index = next++) results[index] = await work(items[index]!, index);
+  };
+  await Promise.all(Array.from({ length: Math.min(width, items.length) }, worker));
+  return results;
 }
 
 function numbered(name: string, attempt: number): string {
@@ -141,11 +193,18 @@ function numbered(name: string, attempt: number): string {
   return `${name.slice(0, name.length - ext.length)}-${attempt}${ext}`;
 }
 
-// A name from the API becomes one plain file name: no folders, no leading dot, nothing Windows would trim or open as a device
+// A name from the API becomes one short plain file name: no folders, no leading dot, nothing Windows would trim or open as a device
 export function safeName(name: string): string {
-  const plain = name.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^[^A-Za-z0-9]+/, "").replace(/\.+$/, "");
+  const plain = shortened(name.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^[^A-Za-z0-9]+/, "")).replace(/\.+$/, "");
   if (!plain) return "output";
   return isDeviceName(plain) ? plain.replace(/^[^.]*/, "$&_") : plain;
+}
+
+// Short enough that the numbered name and its .part file stay far below the 255 bytes file systems allow
+function shortened(name: string): string {
+  if (name.length <= MAX_NAME) return name;
+  const ext = path.extname(name);
+  return ext.length <= 10 ? name.slice(0, MAX_NAME - ext.length) + ext : name.slice(0, MAX_NAME);
 }
 
 function extensionOf(url: string): string {

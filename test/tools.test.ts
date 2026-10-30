@@ -1,10 +1,11 @@
 import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, truncate, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { afterEach, beforeEach, describe, expect, it, onTestFinished } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { ReelSdk } from "../src/api.js";
 import type { ToolContext } from "../src/context.js";
 import { JobRunner } from "../src/jobs.js";
@@ -17,6 +18,7 @@ interface SavedFile {
   name: string;
   path?: string;
   url: string;
+  error?: string;
 }
 
 interface Outcome {
@@ -176,6 +178,17 @@ describe("get_job", () => {
     expect(again.json.status).toBe("succeeded");
     expect(api.requests).toHaveLength(requests);
   });
+
+  it("shares one save between calls that find the job done at the same time", async () => {
+    const client = await connect({ REELSDK_WAIT_S: "0" });
+    const started = await call(client, "make_short", { topic: "the ghost ship Mary Celeste" });
+
+    const [first, second] = await Promise.all([1, 2].map(() => call(client, "get_job", { job_id: started.json.job_id })));
+
+    expect(saved(first!, "video")).toBe(output("short-the-ghost-ship.mp4"));
+    expect(saved(second!, "video")).toBe(output("short-the-ghost-ship.mp4"));
+    expect(api.downloads).toHaveLength(5);
+  });
 });
 
 describe("errors", () => {
@@ -198,6 +211,7 @@ describe("errors", () => {
     expect(outcome.isError).toBe(true);
     expect(outcome.text).toContain("401");
     expect(outcome.text).toContain("REELSDK_KEY");
+    expect(outcome.text).toMatch(/\nRequest-Id: req_[a-z0-9]{16}$/);
   });
 
   it("asks for a key before calling the API", async () => {
@@ -242,6 +256,15 @@ describe("errors", () => {
 
     expect(outcome.isError).toBe(false);
     expect(outcome.json.status).toBe("succeeded");
+  });
+
+  it("refuses a job with more than 20 files without downloading any", async () => {
+    api.scenario.outputs = (file) => Object.fromEntries(Array.from({ length: 21 }, (_, index) => [`part${index}`, file(`part${index}.mp4`)]));
+    const outcome = await call(await connect(), "add_captions", { video: "https://example.com/clip.mp4" });
+
+    expect(outcome.isError).toBe(true);
+    expect(outcome.text).toContain("lists 21 files, and reelsdk-mcp saves at most 20");
+    expect(api.downloads).toEqual([]);
   });
 
   it("explains failed jobs", async () => {
@@ -354,6 +377,35 @@ describe("where files are saved", () => {
     expect(saved(outcome, "../../../evil")).toBe(output("clip-captioned-evil.mp4"));
   });
 
+  it("names the files safely, whatever the input is called", async () => {
+    const outcome = await call(await connect(), "add_captions", { video: "https://media.example.com/v/.env%E2%80%AEgpj.mp4" });
+
+    expect(saved(outcome, "video")).toBe(output("env_gpj-captioned.mp4"));
+  });
+
+  it("shortens a long name from the API", async () => {
+    const long = "x".repeat(250);
+    api.scenario.outputs = (file) => ({ video: file("video.mp4"), [long]: file("long.bin") });
+    const outcome = await call(await connect(), "add_captions", { video: "clip.mp4" });
+
+    expect(saved(outcome, long)).toBe(output(`clip-captioned-${"x".repeat(64)}.bin`));
+  });
+
+  it("refuses to save two of a job's files under one name", async () => {
+    const clashes = [
+      { poster: "poster.jpg", Poster: "poster-2.jpg" },
+      { "a b": "a.mp4", a_b: "b.mp4" },
+    ];
+    for (const names of clashes) {
+      api.scenario.outputs = (file) => ({ video: file("video.mp4"), ...Object.fromEntries(Object.entries(names).map(([name, file_]) => [name, file(file_)])) });
+      const outcome = await call(await connect(), "add_captions", { video: "clip.mp4" });
+
+      expect(outcome.json.files?.map((file) => file.path)).toEqual([undefined, undefined, undefined]);
+      expect(outcome.text).toContain("would both be saved as");
+    }
+    expect(api.downloads).toEqual([]);
+  });
+
   it("names a job without a title safely", async () => {
     api.scenario.finished = { op: "../../../x", result: null };
 
@@ -449,6 +501,64 @@ describe("where files are saved", () => {
     expect(saved(outcome, "srt")).toBeUndefined();
     expect(await readdir(victim)).toEqual(["clip-captioned.srt"]);
     expect(await readFile(path.join(victim, "clip-captioned.srt"), "utf8")).toBe("precious");
+  });
+
+  it("downloads at most 4 files at a time", async () => {
+    let active = 0;
+    let peak = 0;
+    api.scenario.onFile = async (_pathname, res) => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await delay(50);
+      active -= 1;
+      res.end("x");
+      return true;
+    };
+    const outputs = Array.from({ length: 10 }, (_, index) => `out${index}.mp4`);
+
+    const outcome = await call(await connect(), "run_ffmpeg", { inputs: { "in.mp4": "clip.mp4" }, args: ["-i", "in.mp4", ...outputs], outputs });
+
+    expect(outcome.json.files?.filter((file) => file.path)).toHaveLength(10);
+    expect(peak).toBe(4);
+  });
+
+  it("never shows a link's password or control characters", async () => {
+    const logged: string[] = [];
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      logged.push(String(chunk));
+      return true;
+    });
+    onTestFinished(() => stderr.mockRestore());
+    api.scenario.outputs = (file) => ({
+      video: file("video.mp4").replace("http://", "http://user:hunter2@"),
+      srt: "https://elsewhere.example/\u001b[2Jcaptions.srt",
+    });
+
+    const outcome = await call(await connect(), "add_captions", { video: "clip.mp4" });
+
+    expect(outcome.json.files?.map((file) => file.error)).toEqual([expect.stringContaining("refused"), expect.stringContaining("refused")]);
+    for (const text of [outcome.text, logged.join("")]) {
+      expect(text).not.toContain("hunter2");
+      expect(text).not.toContain("\u001b");
+    }
+  });
+
+  it("explains a download that stalled", async () => {
+    const config = { apiKey: GOOD_KEY, baseUrl: api.baseUrl, outputDir: "reelsdk-output", waitSeconds: 30 };
+    const runner = new JobRunner(new ReelSdk(api.baseUrl, GOOD_KEY, { idleMs: 200, bytesPerSecond: 1 }), config, workspace());
+    api.scenario.outputs = (file) => ({ video: file("video.mp4"), srt: file("captions.srt") });
+    api.scenario.onFile = (pathname, res) => {
+      if (!pathname.endsWith("/captions.srt")) return false;
+      res.writeHead(200, { "content-length": "10", "request-id": "req_stalled_file" }).write("x");
+      return true;
+    };
+
+    const { files = [] } = outcomeOf(await runner.start("captions", { video_url: "https://example.com/clip.mp4" }, "clip-captioned", context())).json;
+
+    expect(files.find((file) => file.name === "video")?.path).toBe(output("clip-captioned.mp4"));
+    expect(files.find((file) => file.name === "srt")?.error).toBe(
+      "download failed: no data for 0.2 s\nThe connection stalled or was too slow. The file stays on reelsdk for now: download it from its url.\nRequest-Id: req_stalled_file",
+    );
   });
 
   it("caps the size of all of a job's files together", async () => {

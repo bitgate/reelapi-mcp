@@ -25,6 +25,8 @@ const HINTS: Record<string, string> = {
   OUTPUT_MISSING: "ffmpeg finished without writing every file listed in outputs. Make sure args write exactly those filenames.",
   TIMEOUT: "The job hit its time limit (10 min). Try quality draft or shorter inputs; for run_ffmpeg, a faster preset or a higher timeout_s.",
   BUSY: "reelsdk is at capacity right now. Try again in a minute.",
+  DOWNLOAD_TIMEOUT: "The connection stalled or was too slow. The file stays on reelsdk for now: download it from its url.",
+  TOO_MANY_OUTPUTS: "Get this job from the reelsdk API directly for all of its links.",
 };
 
 const SERVER_HINT = "This failed on reelsdk's side. Try again; if it keeps failing, report the job id.";
@@ -85,6 +87,16 @@ export function failedResult(job: Job): CallToolResult {
   );
 }
 
+export function fileError(error: unknown): string {
+  const lines = [`download failed: ${errorMessage(error)}`];
+  if (error instanceof ApiError) {
+    const hint = HINTS[error.code];
+    if (hint) lines.push(hint);
+    if (error.requestId) lines.push(`Request-Id: ${error.requestId}`);
+  }
+  return lines.join("\n");
+}
+
 export function errorResult(error: unknown): CallToolResult {
   return { content: [{ type: "text", text: describeError(error) }], isError: true };
 }
@@ -101,6 +113,7 @@ function describeError(error: unknown): string {
     ];
     const hint = hintFor(error.code, error.status, error.endpoint);
     if (hint) lines.push(hint);
+    if (error.requestId) lines.push(`Request-Id: ${error.requestId}`);
     return lines.join("\n");
   }
 

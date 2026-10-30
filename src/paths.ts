@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { lstat, mkdir, open, readlink, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
+import { log } from "./log.js";
 
 const MAX_LINKS = 40;
 
@@ -103,7 +104,7 @@ export async function discard(file: string): Promise<void> {
 
 // We stream into a fresh name that is never a link and rename it into place while its folder still resolves to itself.
 // Node has no openat or renameat, so the folder can still be swapped in the moment between that check and the rename
-export async function saveExclusive(source: AsyncIterable<Uint8Array>, destination: string): Promise<void> {
+export async function saveExclusive(source: AsyncIterable<Uint8Array>, destination: string, onDiscarded?: () => void): Promise<void> {
   const dir = path.dirname(destination);
   await assertUnmoved(dir);
 
@@ -115,8 +116,9 @@ export async function saveExclusive(source: AsyncIterable<Uint8Array>, destinati
     await assertUnmoved(dir);
     await rename(temp, destination);
   } catch (error) {
-    await handle.close();
-    await discard(temp).catch(() => {});
+    // The .part name is ours alone, so it goes even when its folder moved or closing failed, and only then is its space free again
+    await handle.close().catch(() => {});
+    await rm(temp, { force: true }).then(onDiscarded, (rmError: unknown) => log(`couldn't remove ${temp}`, rmError));
     throw error;
   }
 }

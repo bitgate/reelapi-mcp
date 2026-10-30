@@ -72,6 +72,7 @@ describe("saveExclusive", () => {
 
     await expect(saveExclusive(bytes("video"), path.join(out, "clip.mp4"))).rejects.toThrow(/moved or became a link/);
     expect(await readFile(path.join(victim, "clip.mp4"), "utf8")).toBe("precious");
+    expect(await readdir(victim)).toEqual(["clip.mp4"]);
   });
 });
 

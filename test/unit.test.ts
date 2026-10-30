@@ -7,7 +7,7 @@ import { plannedNames, safeName, slugify } from "../src/jobs.js";
 import { hasHiddenSegment, isDeviceName, isNetworkPath } from "../src/paths.js";
 import { isMediaHead } from "../src/sniff.js";
 import { VERSION } from "../src/version.js";
-import { resolvePath } from "../src/workspace.js";
+import { resolvePath, Workspace } from "../src/workspace.js";
 
 describe("loadConfig", () => {
   it("requires a key", () => {
@@ -37,6 +37,23 @@ describe("loadConfig", () => {
       expect(loadConfig({ REELSDK_KEY: "k", REELSDK_BASE_URL: url }).ok, url).toBe(false);
     }
   });
+
+  it("keeps only the base URL's origin and path", () => {
+    for (const [url, base] of [
+      ["https://user:secret@api.example.com/v2/?debug=1#top", "https://api.example.com/v2"],
+      ["https://api.example.com/", "https://api.example.com"],
+      ["http://localhost:8787?x=1", "http://localhost:8787"],
+    ]) {
+      expect(loadConfig({ REELSDK_KEY: "k", REELSDK_BASE_URL: url }), url).toMatchObject({ ok: true, config: { baseUrl: base } });
+    }
+  });
+
+  it("refuses an output folder on another machine", () => {
+    for (const dir of ["\\\\server\\share\\out", "//server/share/out", "file://server/share/out"]) {
+      const result = loadConfig({ REELSDK_KEY: "k", REELSDK_OUTPUT_DIR: dir });
+      expect(result.ok ? "" : result.error, dir).toContain("REELSDK_OUTPUT_DIR must be a folder on this computer");
+    }
+  });
 });
 
 describe("output names", () => {
@@ -64,6 +81,9 @@ describe("output names", () => {
       ["lpt9", "lpt9_"],
       ["clip.mp4.", "clip.mp4"],
       ["clip.mp4 . .", "clip.mp4_._"],
+      [`${"a".repeat(250)}.mp4`, `${"a".repeat(60)}.mp4`],
+      ["b".repeat(300), "b".repeat(64)],
+      [`${"c".repeat(63)}.${"d".repeat(10)}`, "c".repeat(63)],
     ];
     for (const [name, safe] of cases) expect(safeName(name), name).toBe(safe);
   });
@@ -78,6 +98,12 @@ describe("resolvePath", () => {
     expect(resolvePath("clip.mp4", "/project")).toBe(path.resolve("/project", "clip.mp4"));
     expect(resolvePath("~/clip.mp4", "/project")).toBe(path.join(os.homedir(), "clip.mp4"));
     expect(resolvePath("file:///tmp/clip.mp4", "/project")).toBe(path.resolve("/tmp/clip.mp4"));
+  });
+
+  it("never takes a project folder on another machine", async () => {
+    const workspace = new Workspace({ CLAUDE_PROJECT_DIR: "\\\\server\\share\\project" }, async () => ["file://server/share/project", "file:///home/me/project"]);
+
+    expect(await workspace.baseDir()).toBe("/home/me/project");
   });
 });
 
