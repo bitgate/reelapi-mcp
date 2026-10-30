@@ -1,9 +1,10 @@
 import type { RmOptions } from "node:fs";
-import { mkdtemp, readdir, readFile, realpath, rm, writeFile, type FileHandle } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ReelSdk } from "../src/api.js";
@@ -14,6 +15,7 @@ import { Workspace } from "../src/workspace.js";
 import { GOOD_KEY, startFakeApi, type FakeApi } from "./fake-api.js";
 
 const hooks = vi.hoisted(() => ({
+  opening: undefined as ((file: string, flags: string | number) => Promise<void>) | undefined,
   opened: undefined as ((handle: FileHandle) => void) | undefined,
   removing: undefined as ((target: string) => void) | undefined,
   checked: undefined as ((target: string) => Promise<void>) | undefined,
@@ -25,6 +27,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   return {
     ...actual,
     async open(file: string, flags: string | number, mode?: number) {
+      await hooks.opening?.(file, flags);
       const handle = await actual.open(file, flags, mode);
       hooks.opened?.(handle);
       return handle;
@@ -50,7 +53,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  hooks.opened = hooks.removing = hooks.checked = undefined;
+  hooks.opening = hooks.opened = hooks.removing = hooks.checked = undefined;
   await rm(out, { recursive: true, force: true });
 });
 
@@ -123,10 +126,10 @@ describe("saving a job's files", () => {
     };
   };
 
-  async function save(): Promise<SavedFile[]> {
+  async function save(op = "captions", body: Record<string, unknown> = { video_url: "https://example.com/clip.mp4" }): Promise<SavedFile[]> {
     const config = { apiKey: GOOD_KEY, baseUrl: api.baseUrl, outputDir: "reelsdk-output", waitSeconds: 30 };
     const runner = new JobRunner(new ReelSdk(api.baseUrl, GOOD_KEY), config, new Workspace({ CLAUDE_PROJECT_DIR: out }, async () => undefined));
-    const result: CallToolResult = await runner.start("captions", { video_url: "https://example.com/clip.mp4" }, "clip", context());
+    const result: CallToolResult = await runner.start(op, body, "clip", context());
     const text = result.content.map((block) => (block.type === "text" ? block.text : "")).join("");
     return (JSON.parse(text.slice(text.indexOf("\n{") + 1)) as { files: SavedFile[] }).files;
   }
@@ -153,5 +156,29 @@ describe("saving a job's files", () => {
 
     expect(files.find((file) => file.name === "srt")?.error).toContain("HTTP 404");
     expect(await readFile(theirs(), "utf8")).toBe("theirs");
+  });
+
+  it("gives back every name it claimed when it can't claim another, and only those", async () => {
+    const taken = path.join(out, "reelsdk-output", "a.mp4");
+    await mkdir(path.dirname(taken));
+    await writeFile(taken, "theirs");
+
+    // b.mp4 fails at once, while the other claims are still on their way
+    let claimed = 0;
+    hooks.opening = async (file, flags) => {
+      if (flags !== "wx") return;
+      if (path.basename(file) === "b.mp4") throw Object.assign(new Error("EACCES: permission denied, open"), { code: "EACCES" });
+      await delay(50);
+    };
+    hooks.opened = () => {
+      claimed += 1;
+    };
+
+    const files = await save("ffmpeg", { outputs: ["a.mp4", "b.mp4", "c.mp4"] });
+    await vi.waitFor(() => expect(claimed).toBe(2));
+
+    expect(files.map((file) => file.error)).toEqual(Array(3).fill(expect.stringContaining("EACCES")));
+    expect(await readdir(path.dirname(taken))).toEqual(["a.mp4"]);
+    expect(await readFile(taken, "utf8")).toBe("theirs");
   });
 });

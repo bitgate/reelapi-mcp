@@ -92,7 +92,7 @@ export class JobRunner {
       const root = await outputRoot(dir, base);
       targets =
         job.op === "ffmpeg"
-          ? await Promise.all(outputs.map(async ([name]) => (await reserve(root, (n) => [numbered(safeName(name), n)]))[0]!))
+          ? await reserveEach(root, outputs.map(([name]) => safeName(name)))
           : await reserve(root, (n) => plannedNames(outputs, n === 1 ? stem : `${stem}-${n}`));
     } catch (error) {
       return failAll(`couldn't write to ${dir} (${errorMessage(error)}); set REELSDK_OUTPUT_DIR to a writable folder`);
@@ -149,6 +149,17 @@ async function reserve(root: string, candidate: (attempt: number) => string[]): 
     if (failure) throw failure.reason;
   }
   throw new Error(`no free filename left in ${root}`);
+}
+
+// Each name is numbered on its own; if one can't be claimed, we wait for the rest and give back the ones we got
+async function reserveEach(root: string, names: string[]): Promise<string[]> {
+  const claims = await Promise.allSettled(names.map(async (name) => (await reserve(root, (n) => [numbered(name, n)]))[0]!));
+  const claimed = claims.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
+  const failure = claims.find((result) => result.status === "rejected");
+  if (!failure) return claimed;
+
+  await Promise.all(claimed.map((target) => discard(target).catch(() => {})));
+  throw failure.reason;
 }
 
 // O_EXCL creates the name or fails, and never follows or replaces what is already there
