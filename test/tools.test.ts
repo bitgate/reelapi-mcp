@@ -1,18 +1,25 @@
-import { mkdtemp, readdir, readFile, rm, truncate, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, truncate, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { MAX_UPLOAD_BYTES } from "../src/media.js";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { ReelSdk } from "../src/api.js";
+import type { ToolContext } from "../src/context.js";
+import { JobRunner } from "../src/jobs.js";
+import { MAX_UPLOAD_BYTES, Media } from "../src/media.js";
+import { errorResult } from "../src/results.js";
 import { createServer } from "../src/server.js";
+import { Workspace } from "../src/workspace.js";
 import { GOOD_KEY, startFakeApi, type FakeApi } from "./fake-api.js";
 
 interface SavedFile {
   name: string;
   path?: string;
   url: string;
+  error?: string;
 }
 
 interface Outcome {
@@ -21,13 +28,17 @@ interface Outcome {
   json: { status?: string; job_id?: string; files?: SavedFile[]; hint?: string; result?: { title?: string } };
 }
 
+const MP4 = Buffer.concat([Buffer.from("\0\0\0\x18ftypisom\0\0\x02\0isomiso2", "latin1"), Buffer.from("local video bytes")]);
+const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);
+const MP3 = Buffer.from("ID3\x04\0\0\0\0\0\0", "latin1");
+
 let api: FakeApi;
 let dir: string;
 
 beforeEach(async () => {
   api = await startFakeApi();
-  dir = await mkdtemp(path.join(os.tmpdir(), "reelsdk-mcp-"));
-  await writeFile(path.join(dir, "clip.mp4"), "local video bytes");
+  dir = await realpath(await mkdtemp(path.join(os.tmpdir(), "reelsdk-mcp-")));
+  await writeFile(path.join(dir, "clip.mp4"), MP4);
 });
 
 afterEach(async () => {
@@ -47,11 +58,23 @@ async function connect(env: Record<string, string | undefined> = {}): Promise<Cl
 
 async function call(client: Client, name: string, args: Record<string, unknown>, onprogress?: (message: string) => void): Promise<Outcome> {
   const options = onprogress ? { onprogress: (progress: { message?: string }) => onprogress(progress.message ?? "") } : undefined;
-  const result = (await client.callTool({ name, arguments: args }, undefined, options)) as CallToolResult;
+  return outcomeOf((await client.callTool({ name, arguments: args }, undefined, options)) as CallToolResult);
+}
+
+function outcomeOf(result: CallToolResult): Outcome {
   const text = result.content.map((block) => (block.type === "text" ? block.text : "")).join("\n");
   const start = text.indexOf("\n{");
   return { isError: result.isError === true, text, json: start >= 0 ? JSON.parse(text.slice(start + 1)) : {} };
 }
+
+async function tempDir(prefix: string): Promise<string> {
+  const created = await realpath(await mkdtemp(path.join(os.tmpdir(), prefix)));
+  onTestFinished(() => rm(created, { recursive: true, force: true }));
+  return created;
+}
+
+const context = (): ToolContext => ({ signal: new AbortController().signal, startedAt: Date.now(), progress: () => {} });
+const workspace = () => new Workspace({ CLAUDE_PROJECT_DIR: dir }, async () => undefined);
 
 const output = (...parts: string[]) => path.join(dir, "reelsdk-output", ...parts);
 const saved = (outcome: Outcome, name: string) => outcome.json.files?.find((file) => file.name === name)?.path;
@@ -64,7 +87,7 @@ describe("add_captions", () => {
     const outcome = await call(client, "add_captions", { video: "clip.mp4", preset: "karaoke", highlight_color: "#00FF00" }, (message) => progress.push(message));
 
     expect(outcome.isError).toBe(false);
-    expect(api.uploads).toMatchObject([{ filename: "clip.mp4", bytes: 17 }]);
+    expect(api.uploads).toMatchObject([{ filename: "clip.mp4", bytes: MP4.length }]);
     expect(api.created).toEqual([{ op: "captions", body: { video_url: uploadUrl("clip.mp4"), style: { preset: "karaoke", highlight_color: "#00FF00" } } }]);
 
     expect(saved(outcome, "video")).toBe(output("clip-captioned.mp4"));
@@ -86,7 +109,8 @@ describe("add_captions", () => {
 
 describe("other tools", () => {
   it("make_slideshow spreads duration_s over the images and uploads local audio", async () => {
-    await Promise.all(["a.jpg", "b.jpg", "song.mp3"].map((name) => writeFile(path.join(dir, name), name)));
+    const files: [string, Buffer][] = [["a.jpg", JPEG], ["b.jpg", JPEG], ["song.mp3", MP3]];
+    await Promise.all(files.map(([name, head]) => writeFile(path.join(dir, name), Buffer.concat([head, Buffer.from(name)]))));
     const client = await connect();
     const outcome = await call(client, "make_slideshow", {
       images: ["a.jpg", "b.jpg", "https://example.com/c.jpg"],
@@ -155,6 +179,118 @@ describe("get_job", () => {
     expect(again.json.status).toBe("succeeded");
     expect(api.requests).toHaveLength(requests);
   });
+
+  it("tries a save again when it failed before saving anything", async () => {
+    let roots = ["file:///bad%2Fpath"];
+    const roaming = new Workspace({}, async () => roots);
+    const config = { apiKey: GOOD_KEY, baseUrl: api.baseUrl, outputDir: output(), waitSeconds: 30 };
+    const runner = new JobRunner(new ReelSdk(api.baseUrl, GOOD_KEY), config, roaming);
+
+    await expect(runner.start("captions", { video_url: "https://example.com/clip.mp4" }, "clip-captioned", context())).rejects.toThrow(/encoded \/ characters/);
+    const jobId = api.requests.map((request) => /job_[a-z0-9]{20}/.exec(request)?.[0]).find(Boolean)!;
+    roots = [`file://${dir}`];
+    roaming.invalidate();
+
+    const retried = runner.resume(jobId, context()).then((result) => saved(outcomeOf(result), "video"));
+    await expect(retried).resolves.toBe(output("clip-captioned.mp4"));
+  });
+
+  it("shares one save between calls that find the job done at the same time", async () => {
+    const client = await connect({ REELSDK_WAIT_S: "0" });
+    const started = await call(client, "make_short", { topic: "the ghost ship Mary Celeste" });
+
+    const [first, second] = await Promise.all([1, 2].map(() => call(client, "get_job", { job_id: started.json.job_id })));
+
+    expect(saved(first!, "video")).toBe(output("short-the-ghost-ship.mp4"));
+    expect(saved(second!, "video")).toBe(output("short-the-ghost-ship.mp4"));
+    expect(api.downloads).toHaveLength(5);
+  });
+
+  const runnerFor = (outputDir = output()) => new JobRunner(new ReelSdk(api.baseUrl, GOOD_KEY), { apiKey: GOOD_KEY, baseUrl: api.baseUrl, outputDir, waitSeconds: 30 }, workspace());
+
+  // Two calls wait on one save that the first one started, while every download hangs until released
+  async function sharedSave() {
+    const job = await new ReelSdk(api.baseUrl, GOOD_KEY).createJob("captions", { video_url: "https://example.com/clip.mp4" }, context().signal);
+    const runner = runnerFor();
+
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    const dropped: string[] = [];
+    api.scenario.onFile = async (pathname, res) => {
+      res.on("close", () => {
+        if (!res.writableFinished) dropped.push(pathname);
+      });
+      await released;
+      if (!res.destroyed) res.end(`bytes of ${pathname}`);
+      return true;
+    };
+    onTestFinished(release);
+
+    const calls = [new AbortController(), new AbortController()];
+    const first = runner.resume(job.id, { ...context(), signal: calls[0]!.signal });
+    await vi.waitFor(() => expect(api.downloads).toHaveLength(4));
+    const second = runner.resume(job.id, { ...context(), signal: calls[1]!.signal });
+    return { job, runner, calls, settled: Promise.allSettled([first, second]), release, dropped };
+  }
+
+  it("keeps saving for the other calls when the call that started the save is cancelled", async () => {
+    const { job, calls, settled, release, dropped } = await sharedSave();
+
+    calls[0]!.abort("the client went away");
+    release();
+    const [cancelled, waited] = await settled;
+
+    expect(cancelled).toMatchObject({ status: "rejected", reason: { name: "AbortError" } });
+    expect(errorResult((cancelled as PromiseRejectedResult).reason).content).toEqual([{ type: "text", text: "Cancelled." }]);
+    const outcome = outcomeOf((waited as PromiseFulfilledResult<CallToolResult>).value);
+    expect(outcome.json.files?.filter((file) => file.path)).toHaveLength(5);
+    expect(await readFile(saved(outcome, "video")!, "utf8")).toBe(`bytes of /f/out/${job.id}/video.mp4`);
+    expect(dropped).toEqual([]);
+  });
+
+  it("stops the save once every call waiting on it is cancelled", async () => {
+    const { job, runner, calls, settled, dropped } = await sharedSave();
+    const late = runner.resume(job.id, { ...context(), signal: AbortSignal.abort("the client went away") }).catch((error: unknown) => error);
+
+    for (const call of calls) call.abort("the client went away");
+    await vi.waitFor(() => expect(dropped).toHaveLength(4));
+
+    expect(await late).toMatchObject({ name: "AbortError" });
+    expect(await settled).toMatchObject([
+      { status: "rejected", reason: { name: "AbortError" } },
+      { status: "rejected", reason: { name: "AbortError" } },
+    ]);
+    await vi.waitFor(async () => expect(await readdir(output(), { recursive: true })).toEqual(["captions"]));
+  });
+
+  it("tries a save again when it saved nothing", async () => {
+    await writeFile(path.join(dir, "blocked"), "");
+    const runner = runnerFor(path.join(dir, "blocked"));
+
+    const refused = outcomeOf(await runner.start("captions", { video_url: "https://example.com/clip.mp4" }, "clip", context()));
+    expect(refused.json.files?.map((file) => file.error)).toEqual(Array(5).fill(expect.stringMatching(/^couldn't write to /)));
+
+    await rm(path.join(dir, "blocked"));
+    const retried = outcomeOf(await runner.resume(refused.json.job_id!, context()));
+    expect(saved(retried, "video")).toBe(path.join(dir, "blocked", "clip.mp4"));
+  });
+
+  it("keeps a save that saved some of the files", async () => {
+    api.scenario.onFile = (pathname, res) => {
+      if (!pathname.endsWith("/captions.srt")) return false;
+      res.writeHead(404).end();
+      return true;
+    };
+    const runner = runnerFor();
+
+    const partial = outcomeOf(await runner.start("captions", { video_url: "https://example.com/clip.mp4" }, "clip", context()));
+    const requests = api.requests.length;
+    const again = outcomeOf(await runner.resume(partial.json.job_id!, context()));
+
+    expect(partial.json.files?.filter((file) => file.path)).toHaveLength(4);
+    expect(again.json.files).toEqual(partial.json.files);
+    expect(api.requests).toHaveLength(requests);
+  });
 });
 
 describe("errors", () => {
@@ -177,6 +313,7 @@ describe("errors", () => {
     expect(outcome.isError).toBe(true);
     expect(outcome.text).toContain("401");
     expect(outcome.text).toContain("REELSDK_KEY");
+    expect(outcome.text).toMatch(/\nRequest-Id: req_[a-z0-9]{16}$/);
   });
 
   it("asks for a key before calling the API", async () => {
@@ -223,6 +360,15 @@ describe("errors", () => {
     expect(outcome.json.status).toBe("succeeded");
   });
 
+  it("refuses a job with more than 20 files without downloading any", async () => {
+    api.scenario.outputs = (file) => Object.fromEntries(Array.from({ length: 21 }, (_, index) => [`part${index}`, file(`part${index}.mp4`)]));
+    const outcome = await call(await connect(), "add_captions", { video: "https://example.com/clip.mp4" });
+
+    expect(outcome.isError).toBe(true);
+    expect(outcome.text).toContain("lists 21 files, and reelsdk-mcp saves at most 20");
+    expect(api.downloads).toEqual([]);
+  });
+
   it("explains failed jobs", async () => {
     api.scenario.failJob = { code: "FFMPEG_FAILED", message: "ffmpeg exited with code 1: Unrecognized option 'nope'" };
     const client = await connect();
@@ -231,5 +377,304 @@ describe("errors", () => {
     expect(outcome.isError).toBe(true);
     expect(outcome.text).toContain("FFMPEG_FAILED");
     expect(outcome.json.hint).toContain("Fix the args");
+  });
+});
+
+describe("what gets uploaded", () => {
+  it("uploads a media file from anywhere on this machine", async () => {
+    const downloads = path.join(await tempDir("reelsdk-home-"), "Downloads");
+    await mkdir(downloads);
+    await writeFile(path.join(downloads, "holiday.mp4"), MP4);
+
+    const outcome = await call(await connect(), "upload_file", { path: path.join(downloads, "holiday.mp4") });
+
+    expect(outcome.isError).toBe(false);
+    expect(api.uploads).toMatchObject([{ filename: "holiday.mp4", bytes: MP4.length }]);
+  });
+
+  it("never uploads a hidden file or anything in a hidden folder, even through a link", async () => {
+    const home = await tempDir("reelsdk-home-");
+    await mkdir(path.join(home, ".ssh"));
+    await mkdir(path.join(home, "vault"));
+    await Promise.all([writeFile(path.join(dir, ".env"), MP4), writeFile(path.join(home, ".ssh", "key.mp4"), MP4), writeFile(path.join(home, "vault", "key.mp4"), MP4)]);
+    await symlink(path.join(home, ".ssh", "key.mp4"), path.join(dir, "innocent.mp4"));
+    await symlink(path.join(home, "vault"), path.join(dir, ".secrets"));
+
+    const client = await connect();
+    for (const input of [".env", path.join(home, ".ssh", "key.mp4"), "~/.ssh/id_rsa", "innocent.mp4", ".secrets/key.mp4"]) {
+      const outcome = await call(client, "upload_file", { path: input });
+      expect(outcome.isError, input).toBe(true);
+      expect(outcome.text, input).toContain("hidden");
+    }
+    expect(api.uploads).toEqual([]);
+  });
+
+  it("only uploads files that start like a video, image, audio or subtitle file", async () => {
+    await writeFile(path.join(dir, "notes.mp4"), "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ\n");
+    await writeFile(path.join(dir, "settings.json"), '{"token": "secret"}');
+
+    const client = await connect();
+    for (const input of ["notes.mp4", "settings.json"]) {
+      expect((await call(client, "upload_file", { path: input })).text, input).toContain("doesn't look like a video");
+    }
+    expect(api.uploads).toEqual([]);
+  });
+
+  it("refuses folders and devices", async () => {
+    await mkdir(path.join(dir, "folder.mp4"));
+
+    const client = await connect();
+    for (const input of ["folder.mp4", "/dev/zero"]) {
+      expect((await call(client, "upload_file", { path: input })).text, input).toContain("is not a file");
+    }
+    expect(api.uploads).toEqual([]);
+  });
+
+  it("never opens a path on another machine", async () => {
+    await symlink("//attacker/share/clip.mp4", path.join(dir, "share.mp4"));
+    const inputs = [
+      "\\\\attacker\\share\\clip.mp4",
+      "//attacker/share/clip.mp4",
+      "\\\\?\\UNC\\attacker\\share\\clip.mp4",
+      "\\\\.\\pipe\\clip",
+      "file://attacker/share/clip.mp4",
+      "share.mp4",
+    ];
+
+    const client = await connect();
+    for (const input of inputs) {
+      expect((await call(client, "add_captions", { video: input })).text, input).toContain("another machine");
+    }
+    expect(api.requests).toEqual([]);
+  });
+
+  it("uploads the file it checked, not one swapped in afterwards", async () => {
+    const media = new Media(new ReelSdk(api.baseUrl, GOOD_KEY), workspace());
+    const clip = path.join(dir, "clip.mp4");
+    await utimes(clip, 1_700_000_000, 1_700_000_000);
+    const checked = await media.localFile("clip.mp4");
+
+    await writeFile(path.join(dir, "secret"), Buffer.alloc(MP4.length, "s"));
+    await utimes(path.join(dir, "secret"), 1_700_000_000, 1_700_000_000);
+    await rename(path.join(dir, "secret"), clip);
+
+    await expect(media.upload(checked, context())).rejects.toThrow("changed while it was being checked");
+    expect(api.uploads).toEqual([]);
+  });
+});
+
+describe("where files are saved", () => {
+  let victim: string;
+
+  beforeEach(async () => {
+    victim = await tempDir("reelsdk-victim-");
+  });
+
+  it("keeps names from the API inside the output folder", async () => {
+    api.scenario.outputs = (file) => ({ video: file("video.mp4"), "../../../evil": file("evil.mp4") });
+
+    const outcome = await call(await connect(), "add_captions", { video: "clip.mp4" });
+
+    expect(saved(outcome, "video")).toBe(output("clip-captioned.mp4"));
+    expect(saved(outcome, "../../../evil")).toBe(output("clip-captioned-evil.mp4"));
+  });
+
+  it("names the files safely, whatever the input is called", async () => {
+    const outcome = await call(await connect(), "add_captions", { video: "https://media.example.com/v/.env%E2%80%AEgpj.mp4" });
+
+    expect(saved(outcome, "video")).toBe(output("env_gpj-captioned.mp4"));
+  });
+
+  it("shortens a long name from the API", async () => {
+    const long = "x".repeat(250);
+    api.scenario.outputs = (file) => ({ video: file("video.mp4"), [long]: file("long.bin") });
+    const outcome = await call(await connect(), "add_captions", { video: "clip.mp4" });
+
+    expect(saved(outcome, long)).toBe(output(`clip-captioned-${"x".repeat(64)}.bin`));
+  });
+
+  it("refuses to save two of a job's files under one name", async () => {
+    const clashes = [
+      { poster: "poster.jpg", Poster: "poster-2.jpg" },
+      { "a b": "a.mp4", a_b: "b.mp4" },
+    ];
+    for (const names of clashes) {
+      api.scenario.outputs = (file) => ({ video: file("video.mp4"), ...Object.fromEntries(Object.entries(names).map(([name, file_]) => [name, file(file_)])) });
+      const outcome = await call(await connect(), "add_captions", { video: "clip.mp4" });
+
+      expect(outcome.json.files?.map((file) => file.path)).toEqual([undefined, undefined, undefined]);
+      expect(outcome.text).toContain("would both be saved as");
+    }
+    expect(api.downloads).toEqual([]);
+  });
+
+  it("names a job without a title safely", async () => {
+    api.scenario.finished = { op: "../../../x", result: null };
+
+    const outcome = await call(await connect(), "make_short", { topic: "the ghost ship" });
+
+    expect(saved(outcome, "video")).toBe(output(`x-${outcome.json.job_id?.slice(-6)}.mp4`));
+  });
+
+  it("saves names Windows reserves for devices under a safe name", async () => {
+    api.scenario.outputs = (file) => ({ "NUL.mp4": file("NUL.mp4"), com1: file("com1") });
+
+    const outcome = await call(await connect(), "run_ffmpeg", { inputs: { "in.mp4": "clip.mp4" }, args: ["-i", "in.mp4", "out.mp4"], outputs: ["out.mp4"] });
+
+    expect(saved(outcome, "NUL.mp4")).toBe(output("NUL_.mp4"));
+    expect(saved(outcome, "com1")).toBe(output("com1_"));
+  });
+
+  it("refuses device names and trailing dots as ffmpeg file names", async () => {
+    const client = await connect();
+    for (const names of [{ inputs: { "CON.mp4": "clip.mp4" } }, { outputs: ["nul"] }, { outputs: ["LPT1.txt"] }, { outputs: ["out."] }]) {
+      const args = { args: ["-version"], outputs: ["out.mp4"], ...names };
+      const refused = await client.callTool({ name: "run_ffmpeg", arguments: args }).then((result) => (result as CallToolResult).isError === true, () => true);
+      expect(refused, JSON.stringify(names)).toBe(true);
+    }
+    expect(api.created).toEqual([]);
+  });
+
+  it("never saves through a link where the output folder should be", async () => {
+    await symlink(victim, path.join(dir, "reelsdk-output"));
+    await symlink(victim, path.join(dir, "renders"));
+
+    for (const outputDir of ["reelsdk-output", "renders/2026"]) {
+      const outcome = await call(await connect({ REELSDK_OUTPUT_DIR: outputDir }), "add_captions", { video: "clip.mp4" });
+      expect(outcome.text, outputDir).toContain("is a link");
+    }
+    expect(await readdir(victim)).toEqual([]);
+  });
+
+  it("never saves through a link inside the output folder", async () => {
+    await mkdir(output(), { recursive: true });
+    await symlink(victim, output("captions"));
+
+    const outcome = await call(await connect(), "add_captions", { video: "clip.mp4" });
+
+    expect(outcome.text).toContain("is a link");
+    expect(await readdir(victim)).toEqual([]);
+  });
+
+  it("saves into a folder the user named outside the project, even one behind a link", async () => {
+    const movies = path.join(await tempDir("reelsdk-home-"), "Movies");
+    await symlink(victim, movies);
+
+    const outcome = await call(await connect({ REELSDK_OUTPUT_DIR: movies }), "add_captions", { video: "clip.mp4" });
+
+    expect(saved(outcome, "video")).toBe(path.join(victim, "clip-captioned.mp4"));
+  });
+
+  it("counts a link at a file's name as taken and leaves it alone", async () => {
+    await mkdir(output("captions"), { recursive: true });
+    await symlink(path.join(victim, "planted.srt"), output("captions", "clip-captioned.srt"));
+
+    const outcome = await call(await connect(), "add_captions", { video: "clip.mp4" });
+
+    expect(saved(outcome, "video")).toBe(output("clip-captioned-2.mp4"));
+    expect(saved(outcome, "srt")).toBe(output("captions", "clip-captioned-2.srt"));
+    expect((await lstat(output("captions", "clip-captioned.srt"))).isSymbolicLink()).toBe(true);
+    expect(await readdir(victim)).toEqual([]);
+  });
+
+  it("ignores a .part link planted next to the output", async () => {
+    await mkdir(output(), { recursive: true });
+    await writeFile(path.join(victim, "precious.txt"), "precious");
+    await symlink(path.join(victim, "precious.txt"), output("clip-captioned.mp4.part"));
+
+    const outcome = await call(await connect(), "add_captions", { video: "clip.mp4" });
+
+    expect(saved(outcome, "video")).toBe(output("clip-captioned.mp4"));
+    expect(await readFile(path.join(victim, "precious.txt"), "utf8")).toBe("precious");
+  });
+
+  it("stops saving into a folder that is swapped for a link mid-save", async () => {
+    await writeFile(path.join(victim, "clip-captioned.srt"), "precious");
+    api.scenario.outputs = (file) => ({ video: file("video.mp4"), srt: file("captions.srt") });
+    api.scenario.onFile = async (pathname) => {
+      if (!pathname.endsWith("/captions.srt")) return;
+      await rename(output("captions"), output("captions-moved"));
+      await symlink(victim, output("captions"));
+    };
+
+    const outcome = await call(await connect(), "add_captions", { video: "clip.mp4" });
+
+    expect(saved(outcome, "video")).toBe(output("clip-captioned.mp4"));
+    expect(saved(outcome, "srt")).toBeUndefined();
+    expect(await readdir(victim)).toEqual(["clip-captioned.srt"]);
+    expect(await readFile(path.join(victim, "clip-captioned.srt"), "utf8")).toBe("precious");
+  });
+
+  it("downloads at most 4 files at a time", async () => {
+    let active = 0;
+    let peak = 0;
+    api.scenario.onFile = async (_pathname, res) => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await delay(50);
+      active -= 1;
+      res.end("x");
+      return true;
+    };
+    const outputs = Array.from({ length: 10 }, (_, index) => `out${index}.mp4`);
+
+    const outcome = await call(await connect(), "run_ffmpeg", { inputs: { "in.mp4": "clip.mp4" }, args: ["-i", "in.mp4", ...outputs], outputs });
+
+    expect(outcome.json.files?.filter((file) => file.path)).toHaveLength(10);
+    expect(peak).toBe(4);
+  });
+
+  it("never shows a link's password or control characters", async () => {
+    const logged: string[] = [];
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      logged.push(String(chunk));
+      return true;
+    });
+    onTestFinished(() => stderr.mockRestore());
+    api.scenario.outputs = (file) => ({
+      video: file("video.mp4").replace("http://", "http://user:hunter2@"),
+      srt: "https://elsewhere.example/\u001b[2Jcaptions.srt",
+    });
+
+    const outcome = await call(await connect(), "add_captions", { video: "clip.mp4" });
+
+    expect(outcome.json.files?.map((file) => file.error)).toEqual([expect.stringContaining("refused"), expect.stringContaining("refused")]);
+    for (const text of [outcome.text, logged.join("")]) {
+      expect(text).not.toContain("hunter2");
+      expect(text).not.toContain("\u001b");
+    }
+  });
+
+  it("explains a download that stalled", async () => {
+    const config = { apiKey: GOOD_KEY, baseUrl: api.baseUrl, outputDir: "reelsdk-output", waitSeconds: 30 };
+    const runner = new JobRunner(new ReelSdk(api.baseUrl, GOOD_KEY, { idleMs: 1000, bytesPerSecond: 1 }), config, workspace());
+    api.scenario.outputs = (file) => ({ video: file("video.mp4"), srt: file("captions.srt") });
+    api.scenario.onFile = (pathname, res) => {
+      if (!pathname.endsWith("/captions.srt")) return false;
+      res.writeHead(200, { "content-length": "10", "request-id": "req_stalled_file" }).write("x");
+      return true;
+    };
+
+    const { files = [] } = outcomeOf(await runner.start("captions", { video_url: "https://example.com/clip.mp4" }, "clip-captioned", context())).json;
+
+    expect(files.find((file) => file.name === "video")?.path).toBe(output("clip-captioned.mp4"));
+    expect(files.find((file) => file.name === "srt")?.error).toBe(
+      "download failed: no data for 1 s\nThe connection stalled or was too slow. The file stays on reelsdk for now: download it from its url.\nRequest-Id: req_stalled_file",
+    );
+  });
+
+  it("caps the size of all of a job's files together", async () => {
+    const config = { apiKey: GOOD_KEY, baseUrl: api.baseUrl, outputDir: "reelsdk-output", waitSeconds: 30 };
+    const runner = new JobRunner(new ReelSdk(api.baseUrl, GOOD_KEY, { outputBytes: 1000 }), config, workspace());
+    api.scenario.outputs = (file) => ({ video: file("video.mp4"), srt: file("captions.srt") });
+    api.scenario.onFile = (_pathname, res) => {
+      res.end("x".repeat(600));
+      return true;
+    };
+
+    const { files = [] } = outcomeOf(await runner.start("captions", { video_url: "https://example.com/clip.mp4" }, "clip-captioned", context())).json;
+
+    expect(files.filter((file) => file.path !== undefined)).toHaveLength(1);
+    expect(JSON.stringify(files)).toContain("more than reelsdk stores");
   });
 });

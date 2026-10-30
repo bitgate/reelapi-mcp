@@ -19,6 +19,9 @@ export interface Scenario {
   failGets: number;
   createError?: { status: number; body: Body };
   failJob?: { code: string; message: string };
+  outputs?: (file: (name: string) => string) => Record<string, string>;
+  finished?: Body;
+  onFile?: (pathname: string, res: ServerResponse) => Promise<boolean | void> | boolean | void;
 }
 
 export interface FakeApi {
@@ -27,6 +30,7 @@ export interface FakeApi {
   requests: string[];
   uploads: { filename: string; bytes: number; url: string }[];
   created: { op: string; body: Body }[];
+  downloads: { path: string; authorization?: string }[];
   close(): Promise<void>;
 }
 
@@ -43,6 +47,7 @@ export async function startFakeApi(): Promise<FakeApi> {
     requests: [],
     uploads: [],
     created: [],
+    downloads: [],
     close: () => new Promise((resolve) => server.close(() => resolve())),
   };
 
@@ -51,7 +56,11 @@ export async function startFakeApi(): Promise<FakeApi> {
     const body = await readBody(req);
     api.requests.push(`${req.method} ${url.pathname}`);
 
-    if (url.pathname.startsWith("/f/")) return send(res, 200, `bytes of ${url.pathname}`);
+    if (url.pathname.startsWith("/f/")) {
+      api.downloads.push({ path: url.pathname, authorization: req.headers.authorization });
+      if (await api.scenario.onFile?.(url.pathname, res)) return;
+      return send(res, 200, `bytes of ${url.pathname}`);
+    }
     if (req.headers.authorization !== `Bearer ${GOOD_KEY}`) return send(res, 401, { error: { code: "UNAUTHORIZED", message: "invalid API key" } });
 
     if (req.method === "POST" && url.pathname === "/v1/uploads") {
@@ -102,11 +111,13 @@ export async function startFakeApi(): Promise<FakeApi> {
       usage: done ? { output_seconds: 12.5 } : {},
       result: done && job.op === "shorts" ? { title: "The Ghost Ship", post_caption: "Nobody was on board.", scenes: [] } : undefined,
       poll_url: `${api.baseUrl}/v1/jobs/${job.id}`,
+      ...(done ? api.scenario.finished : undefined),
     };
   }
 
   function outputsFor(job: FakeJob): Record<string, string> {
     const file = (name: string) => `${api.baseUrl}/f/out/${job.id}/${name}`;
+    if (api.scenario.outputs) return api.scenario.outputs(file);
     if (job.op === "ffmpeg") return Object.fromEntries((job.body.outputs as string[]).map((name) => [name, file(name)]));
 
     const outputs: Record<string, string> = { video: file("video.mp4") };
@@ -129,7 +140,7 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
 
 function send(res: ServerResponse, status: number, body: Body | string): void {
   const text = typeof body === "string" ? body : JSON.stringify(body);
-  res.writeHead(status, { "content-type": typeof body === "string" ? "text/plain" : "application/json" });
+  res.writeHead(status, { "content-type": typeof body === "string" ? "text/plain" : "application/json", "request-id": `req_${token(16)}` });
   res.end(text);
 }
 

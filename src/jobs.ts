@@ -1,21 +1,29 @@
-import { mkdir, open, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, open, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import type { Job, ReelSdk } from "./api.js";
+import { displayUrl, type Job, type ReelSdk } from "./api.js";
 import type { Config } from "./config.js";
 import { elapsedSeconds, type SavedFile, type ToolContext } from "./context.js";
 import { errorMessage, log } from "./log.js";
-import { failedResult, jobAge, runningResult, succeededResult } from "./results.js";
+import { discard, isDeviceName, isInside, placeIn, realDir } from "./paths.js";
+import { failedResult, fileError, jobAge, runningResult, succeededResult } from "./results.js";
 import { resolvePath, type Workspace } from "./workspace.js";
 
 const POLL_WAIT_S = 10;
+const PARALLEL_DOWNLOADS = 4;
+const MAX_NAME = 64;
 const SIDECARS = new Set(["transcript", "srt", "vtt", "ass"]);
-const OUTPUT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 interface Tracked {
   stem?: string;
   job?: Job;
-  files?: SavedFile[];
+  save?: SharedSave;
+}
+
+interface SharedSave {
+  files: Promise<SavedFile[]>;
+  stop: AbortController;
+  waiting: number;
 }
 
 export class JobRunner {
@@ -36,7 +44,7 @@ export class JobRunner {
 
   async resume(jobId: string, ctx: ToolContext): Promise<CallToolResult> {
     const tracked = this.#tracked.get(jobId);
-    if (tracked?.job && tracked.files) return succeededResult(tracked.job, tracked.files, ctx);
+    if (tracked?.job && tracked.save) return succeededResult(tracked.job, await waitFor(tracked.save, ctx), ctx);
     return this.#follow(await this.api.getJob(jobId, 0, ctx.signal), ctx);
   }
 
@@ -55,43 +63,72 @@ export class JobRunner {
     log(`${job.op} job ${job.id} ${job.status}`);
     if (job.status === "failed") return failedResult(job);
 
+    // Calls that find the job done at the same time share one save
     const tracked = this.#tracked.get(job.id) ?? {};
-    const files = await this.#save(job, tracked.stem ?? defaultStem(job), ctx);
-    this.#tracked.set(job.id, { ...tracked, job, files });
-    return succeededResult(job, files, ctx);
+    if (!tracked.job || !tracked.save) {
+      tracked.job = job;
+      tracked.save = this.#startSave(job, tracked, ctx);
+      this.#tracked.set(job.id, tracked);
+    }
+    return succeededResult(tracked.job, await waitFor(tracked.save, ctx), ctx);
+  }
+
+  // The save runs on its own signal, not on the call that started it.
+  // One that threw or saved nothing is dropped, so the next call tries again
+  #startSave(job: Job, tracked: Tracked, ctx: ToolContext): SharedSave {
+    const stop = new AbortController();
+    const files = this.#save(job, tracked.stem ?? defaultStem(job), { ...ctx, signal: stop.signal }).then(
+      (saved) => {
+        if (!saved.some((file) => file.path)) tracked.save = undefined;
+        return saved;
+      },
+      (error: unknown) => {
+        tracked.save = undefined;
+        throw error;
+      },
+    );
+    return { files, stop, waiting: 0 };
   }
 
   async #save(job: Job, stem: string, ctx: ToolContext): Promise<SavedFile[]> {
     const outputs = Object.entries(job.outputs);
     if (outputs.length === 0) return [];
 
-    const dir = resolvePath(this.config.outputDir, await this.workspace.baseDir());
+    const base = await this.workspace.baseDir();
+    const dir = resolvePath(this.config.outputDir, base);
     ctx.progress(`saving ${outputs.length} file(s) to ${dir}`);
+
+    const failAll = (reason: string): SavedFile[] => {
+      log(reason);
+      return outputs.map(([name, url]) => ({ name, url: displayUrl(url), error: reason }));
+    };
+
+    // Names that differ only in case are one file on macOS and Windows, and would keep bumping each other's number
+    const clash = job.op === "ffmpeg" ? undefined : firstClash(plannedNames(outputs, stem));
+    if (clash !== undefined) return failAll(`two of the job's files would both be saved as ${clash}`);
 
     let targets: string[];
     try {
+      const root = await outputRoot(dir, base);
       targets =
         job.op === "ffmpeg"
-          ? await Promise.all(outputs.map(async ([name]) => (await reserve(dir, (n) => [numbered(safeName(name), n)]))[0]!))
-          : await reserve(dir, (n) => plannedNames(outputs, n === 1 ? stem : `${stem}-${n}`));
+          ? await reserveEach(root, outputs.map(([name]) => safeName(name)))
+          : await reserve(root, (n) => plannedNames(outputs, n === 1 ? stem : `${stem}-${n}`));
     } catch (error) {
-      const reason = `couldn't write to ${dir} (${errorMessage(error)}); set REELSDK_OUTPUT_DIR to a writable folder`;
-      log(reason);
-      return outputs.map(([name, url]) => ({ name, url, error: reason }));
+      return failAll(`couldn't write to ${dir} (${errorMessage(error)}); set REELSDK_OUTPUT_DIR to a writable folder`);
     }
 
-    return Promise.all(
-      outputs.map(async ([name, url], index): Promise<SavedFile> => {
-        const target = targets[index]!;
-        try {
-          return { name, url, path: target, bytes: await this.api.download(url, target, ctx.signal) };
-        } catch (error) {
-          await rm(target, { force: true });
-          log(`saving ${url} failed`, error);
-          return { name, url, error: `download failed: ${errorMessage(error)}` };
-        }
-      }),
-    );
+    const budget = this.api.outputBudget();
+    return mapLimited(outputs, PARALLEL_DOWNLOADS, async ([name, url], index): Promise<SavedFile> => {
+      const target = targets[index]!;
+      try {
+        return { name, url: displayUrl(url), path: target, bytes: await this.api.download(url, target, ctx.signal, budget) };
+      } catch (error) {
+        await discard(target).catch(() => {});
+        log(`saving ${displayUrl(url)} failed`, error);
+        return { name, url: displayUrl(url), error: fileError(error) };
+      }
+    });
   }
 }
 
@@ -101,26 +138,103 @@ export function plannedNames(outputs: [string, string][], stem: string): string[
     const ext = extensionOf(url);
     if (name === "transcript") return path.join("captions", `${stem}.transcript${ext}`);
     if (SIDECARS.has(name)) return path.join("captions", `${stem}${ext}`);
-    return name === "video" ? `${stem}${ext}` : `${stem}-${name}${ext}`;
+    return name === "video" ? `${stem}${ext}` : `${stem}-${safeName(name)}${ext}`;
   });
 }
 
-// Never overwrite: bump a numeric suffix until every name is free, then claim the first one atomically
-async function reserve(dir: string, candidate: (attempt: number) => string[]): Promise<string[]> {
+// A folder inside the project is walked without following any link, since the project may be a cloned repo; one named elsewhere is the user's own
+async function outputRoot(dir: string, base: string): Promise<string> {
+  const realBase = await realpath(base);
+  const project = [base, realBase].find((root) => root === dir || isInside(root, dir));
+  if (project !== undefined) return realDir(realBase, path.join(realBase, path.relative(project, dir)));
+
+  await mkdir(dir, { recursive: true });
+  return realpath(dir);
+}
+
+// Never overwrite, not even a link: bump a numeric suffix until every name is ours. Each one is claimed as an empty file,
+// which no other call can claim too, and which only its own download replaces
+async function reserve(root: string, candidate: (attempt: number) => string[]): Promise<string[]> {
   for (let attempt = 1; attempt < 1000; attempt++) {
-    const targets = candidate(attempt).map((name) => path.join(dir, name));
-    const taken = await Promise.all(targets.map((target) => stat(target).then(() => true, () => false)));
+    const targets = await Promise.all(candidate(attempt).map((name) => placeIn(root, name)));
+    const taken = await Promise.all(targets.map((target) => lstat(target).then(() => true, () => false)));
     if (taken.some(Boolean)) continue;
 
-    await Promise.all(targets.map((target) => mkdir(path.dirname(target), { recursive: true })));
-    try {
-      await (await open(targets[0]!, "wx")).close();
-      return targets;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    }
+    const claims = await Promise.allSettled(targets.map(claim));
+    if (claims.every(isClaimed)) return targets;
+
+    // Someone else got one of the names first, so we give back the ones we got
+    await Promise.all(targets.filter((_, index) => isClaimed(claims[index])).map((target) => discard(target).catch(() => {})));
+    const failure = claims.find((result) => result.status === "rejected");
+    if (failure) throw failure.reason;
   }
-  throw new Error(`no free filename left in ${dir}`);
+  throw new Error(`no free filename left in ${root}`);
+}
+
+// Each name is numbered on its own; if one can't be claimed, we wait for the rest and give back the ones we got
+async function reserveEach(root: string, names: string[]): Promise<string[]> {
+  const claims = await Promise.allSettled(names.map(async (name) => (await reserve(root, (n) => [numbered(name, n)]))[0]!));
+  const claimed = claims.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
+  const failure = claims.find((result) => result.status === "rejected");
+  if (!failure) return claimed;
+
+  await Promise.all(claimed.map((target) => discard(target).catch(() => {})));
+  throw failure.reason;
+}
+
+// O_EXCL creates the name or fails, and never follows or replaces what is already there
+async function claim(target: string): Promise<boolean> {
+  try {
+    await (await open(target, "wx")).close();
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+}
+
+function isClaimed(result: PromiseSettledResult<boolean> | undefined): boolean {
+  return result?.status === "fulfilled" && result.value;
+}
+
+function firstClash(names: string[]): string | undefined {
+  const seen = new Set<string>();
+  for (const name of names) {
+    const folded = name.toLowerCase();
+    if (seen.has(folded)) return name;
+    seen.add(folded);
+  }
+  return undefined;
+}
+
+// A cancelled call stops waiting at once; the save stops when the last call waiting on it is cancelled
+async function waitFor(save: SharedSave, ctx: ToolContext): Promise<SavedFile[]> {
+  let stopWaiting!: () => void;
+  const cancelled = new Promise<never>((_, reject) => {
+    stopWaiting = () => reject(new DOMException("This operation was aborted", "AbortError"));
+  });
+  ctx.signal.addEventListener("abort", stopWaiting);
+  if (ctx.signal.aborted) stopWaiting();
+
+  save.waiting += 1;
+  try {
+    return await Promise.race([save.files, cancelled]);
+  } finally {
+    ctx.signal.removeEventListener("abort", stopWaiting);
+    save.waiting -= 1;
+    if (save.waiting === 0 && ctx.signal.aborted) save.stop.abort();
+  }
+}
+
+// At most `width` at once, results in order
+async function mapLimited<T, R>(items: T[], width: number, work: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (let index = next++; index < items.length; index = next++) results[index] = await work(items[index]!, index);
+  };
+  await Promise.all(Array.from({ length: Math.min(width, items.length) }, worker));
+  return results;
 }
 
 function numbered(name: string, attempt: number): string {
@@ -129,9 +243,18 @@ function numbered(name: string, attempt: number): string {
   return `${name.slice(0, name.length - ext.length)}-${attempt}${ext}`;
 }
 
-function safeName(name: string): string {
-  if (OUTPUT_NAME.test(name)) return name;
-  return name.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^[^A-Za-z0-9]+/, "") || "output";
+// A name from the API becomes one short plain file name: no folders, no leading dot, nothing Windows would trim or open as a device
+export function safeName(name: string): string {
+  const plain = shortened(name.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^[^A-Za-z0-9]+/, "")).replace(/\.+$/, "");
+  if (!plain) return "output";
+  return isDeviceName(plain) ? plain.replace(/^[^.]*/, "$&_") : plain;
+}
+
+// Short enough that the numbered name and its .part file stay far below the 255 bytes file systems allow
+function shortened(name: string): string {
+  if (name.length <= MAX_NAME) return name;
+  const ext = path.extname(name);
+  return ext.length <= 10 ? name.slice(0, MAX_NAME - ext.length) + ext : name.slice(0, MAX_NAME);
 }
 
 function extensionOf(url: string): string {
@@ -142,7 +265,7 @@ function extensionOf(url: string): string {
 function defaultStem(job: Job): string {
   const title = (job.result as { title?: unknown } | null | undefined)?.title;
   const slug = typeof title === "string" ? slugify(title) : "";
-  return slug ? `short-${slug}` : `${job.op}-${job.id.slice(-6)}`;
+  return slug ? `short-${slug}` : safeName(`${job.op}-${job.id.slice(-6)}`);
 }
 
 export function slugify(text: string): string {

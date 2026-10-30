@@ -3,10 +3,12 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { CallToolResult, ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod";
+import { MAX_OUTPUTS } from "./api.js";
 import type { ToolContext } from "./context.js";
-import type { JobRunner } from "./jobs.js";
+import { safeName, type JobRunner } from "./jobs.js";
 import { log } from "./log.js";
 import type { Media } from "./media.js";
+import { isDeviceName } from "./paths.js";
 import { errorResult, textResult, ToolError } from "./results.js";
 
 export interface Services {
@@ -34,7 +36,10 @@ const MUSIC_MOODS = ["auto", "none", "lofi", "chill", "upbeat", "cinematic", "dr
 const PRESETS = ["bold", "karaoke", "minimal"] as const;
 
 const color = z.string().regex(/^(#?[0-9a-fA-F]{3}|#?[0-9a-fA-F]{6}|[a-zA-Z]+)$/, "use a hex color like #FFE14D or a color name");
-const fileName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, "use a bare filename like in.mp4");
+const fileName = z
+  .string()
+  .regex(/^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9_-])?$/, "use a bare filename like in.mp4")
+  .refine((name) => !isDeviceName(name), "CON, PRN, AUX, NUL, COM0-9 and LPT0-9 are devices on Windows; use another name");
 const quality = z.enum(["draft", "standard", "high"]).optional().describe("draft renders fastest, high looks best. Default standard.");
 
 export function registerTools(server: McpServer, services: () => Services, settings: ToolSettings): void {
@@ -178,7 +183,7 @@ export function registerTools(server: McpServer, services: () => Services, setti
         args: z
           .union([z.array(z.string()).min(1).max(1000), z.string().min(1)])
           .describe("Arguments after `ffmpeg`, preferably as an array. No shell; refer to inputs and outputs by bare filename."),
-        outputs: z.array(fileName).min(1).max(20).describe('Files your args write that should come back, e.g. ["out.mp4"].'),
+        outputs: z.array(fileName).min(1).max(MAX_OUTPUTS).describe('Files your args write that should come back, e.g. ["out.mp4"].'),
         timeout_s: z.number().int().min(1).max(600).optional().describe("Stop ffmpeg after this many seconds, max 600."),
       },
       annotations: opHints,
@@ -254,8 +259,7 @@ function stemOf(input: string): string {
   const value = input.trim();
   const raw = /^https?:\/\//i.test(value) && URL.canParse(value) ? safeDecode(new URL(value).pathname) : value;
   const base = path.basename(raw);
-  const stem = base.slice(0, base.length - path.extname(base).length);
-  return stem.replace(/[<>:"/\\|?*\u0000-\u001f]+/g, "-").trim().slice(0, 80) || "video";
+  return safeName(base.slice(0, base.length - path.extname(base).length) || "video");
 }
 
 function safeDecode(value: string): string {
