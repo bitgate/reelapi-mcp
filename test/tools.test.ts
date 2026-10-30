@@ -229,7 +229,7 @@ describe("get_job", () => {
     const first = runner.resume(job.id, { ...context(), signal: calls[0]!.signal });
     await vi.waitFor(() => expect(api.downloads).toHaveLength(4));
     const second = runner.resume(job.id, { ...context(), signal: calls[1]!.signal });
-    return { job, calls, settled: Promise.allSettled([first, second]), release, dropped };
+    return { job, runner, calls, settled: Promise.allSettled([first, second]), release, dropped };
   }
 
   it("keeps saving for the other calls when the call that started the save is cancelled", async () => {
@@ -248,11 +248,13 @@ describe("get_job", () => {
   });
 
   it("stops the save once every call waiting on it is cancelled", async () => {
-    const { calls, settled, dropped } = await sharedSave();
+    const { job, runner, calls, settled, dropped } = await sharedSave();
+    const late = runner.resume(job.id, { ...context(), signal: AbortSignal.abort("the client went away") }).catch((error: unknown) => error);
 
     for (const call of calls) call.abort("the client went away");
     await vi.waitFor(() => expect(dropped).toHaveLength(4));
 
+    expect(await late).toMatchObject({ name: "AbortError" });
     expect(await settled).toMatchObject([
       { status: "rejected", reason: { name: "AbortError" } },
       { status: "rejected", reason: { name: "AbortError" } },
