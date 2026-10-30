@@ -191,7 +191,8 @@ describe("get_job", () => {
     roots = [`file://${dir}`];
     roaming.invalidate();
 
-    expect(saved(outcomeOf(await runner.resume(jobId, context())), "video")).toBe(output("clip-captioned.mp4"));
+    const retried = runner.resume(jobId, context()).then((result) => saved(outcomeOf(result), "video"));
+    await expect(retried).resolves.toBe(output("clip-captioned.mp4"));
   });
 
   it("shares one save between calls that find the job done at the same time", async () => {
