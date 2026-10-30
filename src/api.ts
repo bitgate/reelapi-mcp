@@ -146,7 +146,7 @@ export class ReelSdk {
   }
 
   async upload(filename: string, file: UploadFile, signal: AbortSignal): Promise<Upload> {
-    const { data, requestId } = await this.#call({ method: "POST", path: "/v1/uploads", query: { filename }, file, signal, timeoutMs: 30 * 60_000 });
+    const { data, requestId } = await this.#call({ method: "POST", path: "/v1/uploads", query: { filename }, file, retryIf: nothingCreated, signal, timeoutMs: 30 * 60_000 });
     if (typeof data?.url !== "string") throw badResponse("the upload response has no url", "/v1/uploads", requestId);
     return data as unknown as Upload;
   }
@@ -361,7 +361,8 @@ function retryable(error: unknown): boolean {
   return isNetworkFailure(error);
 }
 
-// A job POST is only repeated when the server certainly started nothing: it said so, or the connection never opened
+// A POST (a job or an upload) is only repeated when the server certainly created nothing: it said so, or the connection never opened.
+// A stored upload counts against the key's daily quota, and a repeated one would count twice
 function nothingCreated(error: unknown): boolean {
   if (error instanceof ApiError) return error.status === 408 || error.status === 429;
   return neverSent(error);

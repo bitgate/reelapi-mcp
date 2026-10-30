@@ -1,5 +1,8 @@
+import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import os from "node:os";
+import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { NetworkError, ReelSdk } from "../src/api.js";
@@ -103,6 +106,65 @@ describe("creating a job", () => {
     await listen(port);
 
     await expect(created).resolves.toMatchObject({ id: RUNNING.job.id });
+    expect(hits).toHaveLength(1);
+  });
+});
+
+describe("uploading a file", () => {
+  const UPLOADED = { url: "https://example.com/u/clip.mp4", expires_at: "2026-12-01T00:00:00Z" };
+  const VIDEO = Buffer.from("video bytes");
+
+  async function upload(sdk: ReelSdk): Promise<unknown> {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "reelsdk-upload-"));
+    await writeFile(path.join(dir, "clip.mp4"), VIDEO);
+    const handle = await open(path.join(dir, "clip.mp4"));
+    try {
+      return await sdk.upload("clip.mp4", { handle, size: VIDEO.length }, signal());
+    } finally {
+      await handle.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("retries what the server turned away", async () => {
+    const sdk = new ReelSdk(await listen(), KEY);
+    answers.push(json(429, { error: { code: "RATE_LIMITED", message: "slow down" } }), json(408, { error: { code: "REQUEST_TIMEOUT", message: "too slow" } }), json(201, UPLOADED));
+
+    await expect(upload(sdk)).resolves.toMatchObject({ url: UPLOADED.url });
+    expect(hits).toHaveLength(3);
+  });
+
+  it("never repeats an upload the server may have stored", async () => {
+    const sdk = new ReelSdk(await listen(), KEY);
+    for (const status of [500, 502, 503, 504]) {
+      answers.push(json(status, { error: { code: "INTERNAL", message: "oops" } }));
+      await expect(upload(sdk), String(status)).rejects.toMatchObject({ status });
+    }
+
+    expect(hits).toHaveLength(4);
+  });
+
+  it("never repeats an upload whose connection dropped after it was sent", async () => {
+    const sdk = new ReelSdk(await listen(), KEY);
+    answers.push((res) => res.socket?.destroy());
+
+    const error = await failure(upload(sdk));
+
+    expect(error).toBeInstanceOf(NetworkError);
+    expect((error as Error).message).toMatch(/^Lost the connection to /);
+    expect(hits).toHaveLength(1);
+  });
+
+  it("retries an upload whose connection was refused", async () => {
+    const port = await freePort();
+    const sdk = new ReelSdk(`http://127.0.0.1:${port}`, KEY);
+    answers.push(json(201, UPLOADED));
+
+    const uploaded = upload(sdk);
+    await delay(100);
+    await listen(port);
+
+    await expect(uploaded).resolves.toMatchObject({ url: UPLOADED.url });
     expect(hits).toHaveLength(1);
   });
 });
