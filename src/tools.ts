@@ -259,7 +259,7 @@ function stemOf(input: string): string {
   const value = input.trim();
   const raw = /^https?:\/\//i.test(value) && URL.canParse(value) ? safeDecode(new URL(value).pathname) : value;
   const base = path.basename(raw);
-  return safeName(base.slice(0, base.length - path.extname(base).length));
+  return safeName(base.slice(0, base.length - path.extname(base).length) || "video");
 }
 
 function safeDecode(value: string): string {

@@ -1,4 +1,4 @@
-import { renameSync, rmSync, symlinkSync } from "node:fs";
+import { lstatSync, renameSync, rmSync, symlinkSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -9,7 +9,11 @@ import { Media } from "../src/media.js";
 import { Workspace } from "../src/workspace.js";
 import { GOOD_KEY, startFakeApi, type FakeApi } from "./fake-api.js";
 
-const hooks = vi.hoisted(() => ({ resolving: undefined as ((target: string) => void) | undefined }));
+const hooks = vi.hoisted(() => ({
+  resolving: undefined as ((target: string) => void) | undefined,
+  opening: undefined as ((target: string) => void) | undefined,
+  opened: undefined as ((target: string) => void) | undefined,
+}));
 
 // Windows has no O_NOFOLLOW, so here open follows a link at the last step too
 vi.mock("node:fs", async (importOriginal) => {
@@ -24,6 +28,14 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     async realpath(target: string) {
       hooks.resolving?.(target);
       return actual.realpath(target);
+    },
+    async open(target: string, flags: string | number, mode?: number) {
+      hooks.opening?.(target);
+      try {
+        return await actual.open(target, flags, mode);
+      } finally {
+        hooks.opened?.(target);
+      }
     },
   };
 });
@@ -48,7 +60,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  hooks.resolving = undefined;
+  hooks.resolving = hooks.opening = hooks.opened = undefined;
   await api.close();
   await rm(root, { recursive: true, force: true });
 });
@@ -71,6 +83,25 @@ describe("uploads where the file system can't refuse links", () => {
       rmSync(clip());
       symlinkSync(path.join(root, "private", "clip.mp4"), clip());
     });
+
+    await expect(media.toUrl(clip(), context())).rejects.toThrow(/changed while it was being checked/);
+    expect(api.uploads).toEqual([]);
+  });
+
+  it("refuse a file that only turns into a link while it is being opened", async () => {
+    const original = `${clip()}.original`;
+    const isLink = () => lstatSync(clip()).isSymbolicLink();
+    const toLink = () => {
+      renameSync(clip(), original);
+      symlinkSync(path.join(root, "private", "clip.mp4"), clip());
+    };
+    const back = () => {
+      rmSync(clip());
+      renameSync(original, clip());
+    };
+    swapAfterThePathCheck(toLink);
+    hooks.opening = (target) => target === clip() && !isLink() && toLink();
+    hooks.opened = (target) => target === clip() && isLink() && back();
 
     await expect(media.toUrl(clip(), context())).rejects.toThrow(/changed while it was being checked/);
     expect(api.uploads).toEqual([]);
