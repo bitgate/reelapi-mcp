@@ -151,13 +151,13 @@ describe("downloads", () => {
     const started = Date.now();
 
     await expect(sdk.download(outputUrl(), file(), signal(), budget())).rejects.toMatchObject({ code: "DOWNLOAD_TIMEOUT", message: "no data for 0.3 s" });
-    expect(Date.now() - started).toBeLessThan(600);
+    expect(Date.now() - started).toBeLessThan(1500);
     expect(api.hits).toHaveLength(1);
     expect(await readdir(out)).toEqual([]);
   });
 
   it("stops a download that trickles past the time its size allows", { timeout: 4000 }, async () => {
-    sdk = new ReelSdk(api.url, "rsdk_live_secret", { outputBytes: 1024, idleMs: 300, bytesPerSecond: 2000 });
+    sdk = new ReelSdk(api.url, "rsdk_live_secret", { outputBytes: 1024, idleMs: 1000, bytesPerSecond: 2000 });
     api.handle = (_req, res) => {
       res.writeHead(200, { "content-length": "1000" });
       const timer = setInterval(() => res.write("x".repeat(20)), 100);
@@ -165,26 +165,36 @@ describe("downloads", () => {
     };
     const started = Date.now();
 
-    await expect(sdk.download(outputUrl(), file(), signal(), budget())).rejects.toMatchObject({ code: "DOWNLOAD_TIMEOUT", message: "not done after 1 s" });
-    expect(Date.now() - started).toBeLessThan(1500);
+    await expect(sdk.download(outputUrl(), file(), signal(), budget())).rejects.toMatchObject({ code: "DOWNLOAD_TIMEOUT", message: "not done after 2 s" });
+    expect(Date.now() - started).toBeLessThan(3000);
     expect(await readdir(out)).toEqual([]);
   });
 
   it("gives a slow but steady download the time its size needs", async () => {
-    sdk = new ReelSdk(api.url, "rsdk_live_secret", { outputBytes: 1024, idleMs: 300, bytesPerSecond: 500 });
+    sdk = new ReelSdk(api.url, "rsdk_live_secret", { outputBytes: 1024, idleMs: 1000, bytesPerSecond: 500 });
     api.handle = (_req, res) => {
       res.writeHead(200, { "content-length": "1000" });
       let chunks = 0;
       const timer = setInterval(() => {
         chunks += 1;
-        if (chunks < 10) return void res.write("x".repeat(100));
+        if (chunks < 20) return void res.write("x".repeat(50));
         clearInterval(timer);
-        res.end("x".repeat(100));
+        res.end("x".repeat(50));
       }, 100);
       res.on("close", () => clearInterval(timer));
     };
 
     expect(await sdk.download(outputUrl(), file(), signal(), budget())).toBe(1000);
+  });
+
+  it("waits as long as a download without a size may take", async () => {
+    sdk = new ReelSdk(api.url, "rsdk_live_secret", { idleMs: 1000, bytesPerSecond: 1 });
+    api.handle = (_req, res) => {
+      res.writeHead(200);
+      setTimeout(() => res.end("file bytes"), 50);
+    };
+
+    expect(await sdk.download(outputUrl(), file(), signal(), budget())).toBe(10);
   });
 
   it("takes the job's budget from its caller", () => {

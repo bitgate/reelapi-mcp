@@ -95,6 +95,7 @@ const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const NOT_CONNECTED = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "UND_ERR_CONNECT_TIMEOUT"]);
 const REQUEST_ID = /^[\w-]{1,128}$/;
+const MAX_TIMER_MS = 2 ** 31 - 1;
 const USER_AGENT = `reelsdk-mcp/${VERSION} node/${process.versions.node}`;
 
 // reelsdk stores at most 2 GiB of files per job, and none of its JSON answers comes near 8 MiB.
@@ -185,8 +186,10 @@ export class ReelSdk {
           throw tooLarge();
         }
 
+        // Node fires a timer longer than MAX_TIMER_MS at once
         const allowedMs = idleMs + (size / bytesPerSecond) * 1000;
-        overallTimer ??= setTimeout(() => overall.abort(timedOut(`not done after ${Math.round(allowedMs / 1000)} s`)), started + allowedMs - Date.now());
+        const stop = () => overall.abort(timedOut(`not done after ${Math.round(allowedMs / 1000)} s`));
+        overallTimer ??= setTimeout(stop, Math.min(started + allowedMs - Date.now(), MAX_TIMER_MS));
 
         // We count every byte against the job's budget, whatever Content-Length said, and get them back once a failed attempt's file is gone
         let bytes = 0;
@@ -365,9 +368,8 @@ function nothingCreated(error: unknown): boolean {
 }
 
 function neverSent(error: unknown): boolean {
-  const cause = error instanceof Error ? error.cause : undefined;
-  const causes = cause instanceof AggregateError ? cause.errors : [cause];
-  return causes.length > 0 && causes.every((each) => NOT_CONNECTED.has((each as NodeJS.ErrnoException | undefined)?.code ?? ""));
+  const cause = error instanceof Error ? (error.cause as NodeJS.ErrnoException | undefined) : undefined;
+  return NOT_CONNECTED.has(cause?.code ?? "");
 }
 
 function isNetworkFailure(error: unknown): boolean {
@@ -406,7 +408,7 @@ function jobFrom({ data, requestId }: Answer, endpoint: string): Job {
 
   const count = Object.keys(outputs).length;
   if (count > MAX_OUTPUTS) {
-    throw new ApiError(502, "TOO_MANY_OUTPUTS", `the job lists ${count} files, and reelsdk-mcp saves at most ${MAX_OUTPUTS}`, endpoint, { requestId, retryable: false });
+    throw new ApiError(502, "TOO_MANY_OUTPUTS", `the job lists ${count} files, and reelsdk-mcp saves at most ${MAX_OUTPUTS}`, endpoint, { requestId });
   }
   return { ...job, outputs };
 }
@@ -417,7 +419,7 @@ function isOutputMap(value: unknown): value is Record<string, string> {
 }
 
 function badResponse(message: string, endpoint: string, requestId: string | undefined): ApiError {
-  return new ApiError(502, "BAD_RESPONSE", message, endpoint, { requestId, retryable: false });
+  return new ApiError(502, "BAD_RESPONSE", message, endpoint, { requestId });
 }
 
 function isIssue(value: unknown): value is Issue {

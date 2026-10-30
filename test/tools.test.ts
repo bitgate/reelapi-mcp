@@ -179,6 +179,20 @@ describe("get_job", () => {
     expect(api.requests).toHaveLength(requests);
   });
 
+  it("tries a save again when it failed before saving anything", async () => {
+    let roots = ["file:///bad%2Fpath"];
+    const roaming = new Workspace({}, async () => roots);
+    const config = { apiKey: GOOD_KEY, baseUrl: api.baseUrl, outputDir: output(), waitSeconds: 30 };
+    const runner = new JobRunner(new ReelSdk(api.baseUrl, GOOD_KEY), config, roaming);
+
+    await expect(runner.start("captions", { video_url: "https://example.com/clip.mp4" }, "clip-captioned", context())).rejects.toThrow(/encoded \/ characters/);
+    const jobId = api.requests.map((request) => /job_[a-z0-9]{20}/.exec(request)?.[0]).find(Boolean)!;
+    roots = [`file://${dir}`];
+    roaming.invalidate();
+
+    expect(saved(outcomeOf(await runner.resume(jobId, context())), "video")).toBe(output("clip-captioned.mp4"));
+  });
+
   it("shares one save between calls that find the job done at the same time", async () => {
     const client = await connect({ REELSDK_WAIT_S: "0" });
     const started = await call(client, "make_short", { topic: "the ghost ship Mary Celeste" });
@@ -545,7 +559,7 @@ describe("where files are saved", () => {
 
   it("explains a download that stalled", async () => {
     const config = { apiKey: GOOD_KEY, baseUrl: api.baseUrl, outputDir: "reelsdk-output", waitSeconds: 30 };
-    const runner = new JobRunner(new ReelSdk(api.baseUrl, GOOD_KEY, { idleMs: 200, bytesPerSecond: 1 }), config, workspace());
+    const runner = new JobRunner(new ReelSdk(api.baseUrl, GOOD_KEY, { idleMs: 1000, bytesPerSecond: 1 }), config, workspace());
     api.scenario.outputs = (file) => ({ video: file("video.mp4"), srt: file("captions.srt") });
     api.scenario.onFile = (pathname, res) => {
       if (!pathname.endsWith("/captions.srt")) return false;
@@ -557,7 +571,7 @@ describe("where files are saved", () => {
 
     expect(files.find((file) => file.name === "video")?.path).toBe(output("clip-captioned.mp4"));
     expect(files.find((file) => file.name === "srt")?.error).toBe(
-      "download failed: no data for 0.2 s\nThe connection stalled or was too slow. The file stays on reelsdk for now: download it from its url.\nRequest-Id: req_stalled_file",
+      "download failed: no data for 1 s\nThe connection stalled or was too slow. The file stays on reelsdk for now: download it from its url.\nRequest-Id: req_stalled_file",
     );
   });
 
