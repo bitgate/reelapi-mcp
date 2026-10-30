@@ -138,6 +138,7 @@ describe("saving a job's files", () => {
 
     expect(await readFile(theirs(), "utf8")).toBe("theirs");
     expect(files.find((file) => file.name === "srt")?.path).toBe(path.join(out, "reelsdk-output", "captions", "clip-2.srt"));
+    expect((await readdir(path.join(out, "reelsdk-output"))).sort()).toEqual(["captions", "clip-2.mp4"]);
   });
 
   it("never deletes a file another call claimed when its own download fails", async () => {
